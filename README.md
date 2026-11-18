@@ -4,10 +4,9 @@
 
 DELTA-TTS converts a pretrained autoregressive TTS model into a discrete diffusion language model with LoRA and a convolution module, so that speech tokens are decoded in confidence order instead of left to right.
 
-<!-- TODO: OpenReview badge -> NeurIPS 2026 forum link -->
 [![Demo](https://img.shields.io/badge/Demo-Page-blue)](https://slpr-lab.github.io/DELTA-TTS/)
 [![arXiv](https://img.shields.io/badge/arXiv-2607.04140-B31B1B)](https://arxiv.org/abs/2607.04140)
-[![OpenReview](https://img.shields.io/badge/OpenReview-Coming_Soon-9F9F9F)](#)
+[![OpenReview](https://img.shields.io/badge/OpenReview-NeurIPS_2026-8C1B13)](https://openreview.net/forum?id=c4cM3P84zM)
 [![Hugging Face](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Model-FFD21E)](https://huggingface.co/slpr-lab/DELTA-TTS)
 
 ## News
@@ -74,10 +73,11 @@ We thank the authors for releasing their work.
 
 ```bibtex
 @inproceedings{moon2026deltatts,
-  title     = {{DELTA-TTS}: Adapting Autoregressive Model into Diffusion Language Model for Text-to-Speech},
-  author    = {Moon, Junwon and Lee, Yejin and Kim, Seungbeom and Ahn, Hoseong and Park, Sewoong and Kim, Heeseung and Shim, Kyuhong},
-  booktitle = {Advances in Neural Information Processing Systems},
-  year      = {2026}
+  title     = {{DELTA}-{TTS}: Adapting Autoregressive Model into Diffusion Language Model for Text-to-Speech},
+  author    = {Junwon Moon and Yejin Lee and Seungbeom Kim and Hoseong Ahn and Sewoong Park and Heeseung Kim and Kyuhong Shim},
+  booktitle = {The Fortieth Annual Conference on Neural Information Processing Systems},
+  year      = {2026},
+  url       = {https://openreview.net/forum?id=c4cM3P84zM}
 }
 ```
 

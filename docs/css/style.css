@@ -43,9 +43,7 @@ b, strong { font-weight: 700; }
   gap: 10px 14px;
   margin: 1.25rem 0 2rem;
 }
-.badges a,
-.badges .badge-soon { display: inline-block; line-height: 0; }
-.badges .badge-soon { cursor: default; }
+.badges a { display: inline-block; line-height: 0; }
 .badges img { height: 22px; width: auto; }
 .badges a:hover img { filter: brightness(1.15); }
 
