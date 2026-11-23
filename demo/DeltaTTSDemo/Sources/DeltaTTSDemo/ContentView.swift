@@ -360,9 +360,9 @@ struct RecordStep: View {
                 Teleprompter(text: model.transcript, size: TypeSize.prompter * scale, active: false)
                 HStack(alignment: .firstTextBaseline, spacing: 16 * scale) {
                     if let take = model.recorder.take {
-                        Label("Recorded \(formatSeconds(take.duration))", systemImage: "checkmark.circle.fill")
-                            .foregroundStyle(Theme.accent)
-                            .fontWeight(.medium)
+                        Text("Recorded \(formatSeconds(take.duration))")
+                            .foregroundStyle(Theme.secondaryText)
+                        PrepareStatus()
                     } else {
                         Text("Your recording is used only for this demo and is deleted on \u{201C}Next visitor\u{201D} or when the app quits.")
                             .foregroundStyle(Theme.tertiaryText)
@@ -372,6 +372,7 @@ struct RecordStep: View {
                     SampleVoiceMenu(title: "No microphone? Use a sample voice")
                 }
                 .scaledFont(TypeSize.caption)
+                RecordingNotices()
             case .preset:
                 Text("Sample voice: \(model.selectedPreset?.name ?? "")")
                     .scaledFont(TypeSize.body, weight: .semibold)
@@ -380,6 +381,7 @@ struct RecordStep: View {
                     .foregroundStyle(Theme.secondaryText)
                     .fixedSize(horizontal: false, vertical: true)
                 HStack(spacing: 16 * scale) {
+                    PrepareStatus()
                     Button("Use my own voice", action: model.useOwnVoice)
                         .buttonStyle(.borderless)
                         .foregroundStyle(Theme.accent)
@@ -388,7 +390,66 @@ struct RecordStep: View {
                     Spacer()
                 }
                 .scaledFont(TypeSize.caption)
+                RecordingNotices()
             }
+        }
+    }
+}
+
+/// The server preparing the voice (/prepare): "Preparing your voice..." with a spinner, then "Ready".
+struct PrepareStatus: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.uiScale) private var scale
+
+    var body: some View {
+        switch model.prepareState {
+        case .idle:
+            EmptyView()
+        case .preparing:
+            HStack(spacing: 6 * scale) {
+                ProgressView().controlSize(.mini)
+                Text("Preparing your voice...")
+                    .foregroundStyle(Theme.secondaryText)
+            }
+        case .ready:
+            Label("Ready", systemImage: "checkmark.circle.fill")
+                .foregroundStyle(Theme.accent)
+                .fontWeight(.medium)
+        case .failed:
+            // Generate still works: it sends the recording again.
+            Text("Will be prepared when you generate")
+                .foregroundStyle(Theme.tertiaryText)
+                .help(model.prepareFailure ?? "")
+        }
+    }
+}
+
+/// Notices about the recording (too short, no speech, ...), next to it in step 1.
+struct RecordingNotices: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.uiScale) private var scale
+
+    var body: some View {
+        let notices = model.recordingNotices
+        if !notices.isEmpty {
+            VStack(alignment: .leading, spacing: 6 * scale) {
+                ForEach(notices) { notice in
+                    Label {
+                        Text(notice.message)
+                            .foregroundStyle(Theme.primaryText)
+                            .fixedSize(horizontal: false, vertical: true)
+                    } icon: {
+                        Image(systemName: notice.level.systemImage)
+                            .foregroundStyle(notice.level.color)
+                    }
+                }
+            }
+            .scaledFont(TypeSize.banner)
+            .padding(.horizontal, 12 * scale)
+            .padding(.vertical, 8 * scale)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(notices.contains { $0.level == .error } ? Theme.errorTint : Theme.warningTint,
+                        in: .rect(cornerRadius: 10))
         }
     }
 }
@@ -625,8 +686,15 @@ struct ActionBar: View {
     var body: some View {
         // No GlassEffectContainer: it would blend the neutral buttons into the tinted primary one.
         HStack(spacing: 28 * scale) {
-            HStack(spacing: 16 * scale) { leading }
-                .frame(maxWidth: .infinity, alignment: .trailing)
+            HStack(spacing: 16 * scale) {
+                if showNextVisitor {
+                    // At the far edge, away from the primary button, so it is not hit by accident.
+                    NextVisitorButton(compact: false)
+                }
+                Spacer(minLength: 0)
+                leading
+            }
+            .frame(maxWidth: .infinity)
             PrimaryButton()
             HStack(spacing: 16 * scale) { trailing }
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -652,10 +720,7 @@ struct ActionBar: View {
     /// Right of the primary button: listen to the recording or play the voice again, edit the text.
     @ViewBuilder private var trailing: some View {
         if canChangeRecording, model.promptURL != nil {
-            if model.primaryAction == .nextVisitor {
-                SecondaryButton(title: "Play again", systemImage: "play.fill", help: "Play your voice again (\u{2318}P)",
-                                action: model.toggleOutputPlayback)
-            } else if !model.outputIsCurrent {
+            if !model.outputIsCurrent {
                 let playing = model.promptPlayer.isPlaying
                 SecondaryButton(title: playing ? "Stop" : (model.selection == .recording ? "Play my recording" : "Play sample"),
                                 systemImage: playing ? "stop.fill" : "play.fill",
@@ -671,6 +736,11 @@ struct ActionBar: View {
 
     private var canChangeRecording: Bool {
         !model.recorder.isCapturing && !model.isSynthesizing && !model.isResetting
+    }
+
+    /// Once the generated voice has been heard, Next visitor also appears here (it is always in the header).
+    private var showNextVisitor: Bool {
+        canChangeRecording && model.outputIsCurrent && model.player.timesFinished > 0
     }
 }
 
@@ -731,19 +801,28 @@ struct SecondaryButton: View {
 struct NextVisitorButton: View {
     @Environment(AppModel.self) private var model
     @Environment(\.uiScale) private var scale
+    var compact = true  // the header's tinted button; false: a neutral one for the action bar
 
     var body: some View {
-        Button {
-            Task { await model.nextVisitor() }
-        } label: {
-            Label("Next visitor", systemImage: "arrow.counterclockwise")
-                .scaledFont(TypeSize.body, weight: .semibold)
-                .padding(.horizontal, 4 * scale)
+        if compact {
+            Button(action: next) {
+                Label("Next visitor", systemImage: "arrow.counterclockwise")
+                    .scaledFont(TypeSize.body, weight: .semibold)
+                    .padding(.horizontal, 4 * scale)
+            }
+            .buttonStyle(.bordered)
+            .tint(Theme.accent)
+            .controlSize(.large)
+            .disabled(model.isResetting || model.recorder.isCapturing)
+            .help("Delete this visitor's recording and start over (\u{2318}N)")
+        } else {
+            SecondaryButton(title: "Next visitor", systemImage: "arrow.counterclockwise",
+                            help: "Delete this visitor's recording and start over (\u{2318}N)", action: next)
+                .disabled(model.isResetting)
         }
-        .buttonStyle(.bordered)
-        .tint(Theme.accent)
-        .controlSize(.large)
-        .disabled(model.isResetting || model.recorder.isCapturing)
-        .help("Delete this visitor's recording and start over (\u{2318}N)")
+    }
+
+    private func next() {
+        Task { await model.nextVisitor() }
     }
 }

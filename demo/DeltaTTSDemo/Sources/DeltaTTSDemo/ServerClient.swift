@@ -40,12 +40,14 @@ struct Health: Decodable, Equatable, Sendable {
     }
 }
 
-/// POST /synthesize body. Keys are encoded as snake_case.
+/// POST /synthesize body. Keys are encoded as snake_case. The prompt is either `promptId` (from
+/// /prepare) or the audio itself.
 struct SynthesisRequest: Encodable, Sendable {
     var text: String
     var promptText: String
-    var promptWavBase64: String
-    var promptWavName: String
+    var promptId: String?
+    var promptWavBase64: String?
+    var promptWavName: String?
     var lengthScale: Double
     var numSteps: Int
     var temperature: Double
@@ -56,6 +58,30 @@ struct SynthesisRequest: Encodable, Sendable {
     var trimPrompt: Bool
     var trimOutput: Bool
     var warnings: DemoConfig.Thresholds
+}
+
+/// POST /prepare body: the prompt part of a synthesis request.
+struct PrepareRequest: Encodable, Sendable {
+    var promptText: String
+    var promptWavBase64: String
+    var promptWavName: String
+    var enhancePrompt: Bool
+    var trimPrompt: Bool
+    var trimOutput: Bool
+    var warnings: DemoConfig.Thresholds
+}
+
+/// POST /prepare response.
+struct PrepareResponse: Decodable, Sendable {
+    var promptId: String
+    var durationSeconds: Double
+    var warnings: [Notice]
+
+    enum CodingKeys: String, CodingKey {
+        case warnings
+        case promptId = "prompt_id"
+        case durationSeconds = "duration_s"
+    }
 }
 
 /// POST /synthesize response.
@@ -105,21 +131,27 @@ private struct ErrorResponse: Decodable {
 
 enum ServerError: LocalizedError {
     case unreachable(URL, String)
-    case http(status: Int, message: String, notices: [Notice])
+    case http(status: Int, message: String, notices: [Notice], code: String?)
     case invalidResponse(String)
 
     var errorDescription: String? {
         switch self {
         case .unreachable(let url, let reason): "Cannot reach the server at \(url.absoluteString) (\(reason))."
-        case .http(let status, let message, _): "\(message) (HTTP \(status))"
+        case .http(let status, let message, _, _): "\(message) (HTTP \(status))"
         case .invalidResponse(let reason): "Unexpected response from the server: \(reason)"
         }
     }
 
     /// Notices the server sent along with the error.
     var notices: [Notice] {
-        if case .http(_, _, let notices) = self { return notices }
+        if case .http(_, _, let notices, _) = self { return notices }
         return []
+    }
+
+    /// The server's error code (e.g. "prompt_unknown").
+    var code: String? {
+        if case .http(_, _, _, let code) = self { return code }
+        return nil
     }
 }
 
@@ -134,14 +166,24 @@ struct ServerClient: Sendable {
     }
 
     func synthesize(_ body: SynthesisRequest) async throws -> SynthesisResponse {
+        try await post("synthesize", body, timeout: 900, as: SynthesisResponse.self)  // long texts on a slow device
+    }
+
+    /// Process the prompt ahead of synthesis (VAD trim, enhancement, features).
+    func prepare(_ body: PrepareRequest) async throws -> PrepareResponse {
+        try await post("prepare", body, timeout: 300, as: PrepareResponse.self)  // the first call loads RE-USE
+    }
+
+    private func post<Body: Encodable, T: Decodable>(_ path: String, _ body: Body, timeout: TimeInterval,
+                                                    as type: T.Type) async throws -> T {
         let encoder = JSONEncoder()
         encoder.keyEncodingStrategy = .convertToSnakeCase
-        var request = URLRequest(url: baseURL.appending(path: "synthesize"))
+        var request = URLRequest(url: baseURL.appending(path: path))
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try encoder.encode(body)
-        request.timeoutInterval = 900  // long texts on a slow device
-        return try await send(request, as: SynthesisResponse.self)
+        request.timeoutInterval = timeout
+        return try await send(request, as: T.self)
     }
 
     /// Make the server forget the previous visitor (uploaded prompts, cached prompt features).
@@ -178,10 +220,10 @@ struct ServerClient: Sendable {
         guard let http = response as? HTTPURLResponse else { throw ServerError.invalidResponse("not HTTP") }
         guard http.statusCode == 200 else {
             if let body = try? JSONDecoder().decode(ErrorResponse.self, from: data) {
-                throw ServerError.http(status: http.statusCode, message: body.error, notices: body.warnings ?? [])
+                throw ServerError.http(status: http.statusCode, message: body.error, notices: body.warnings ?? [], code: body.code)
             }
             let text = String(decoding: data.prefix(300), as: UTF8.self)
-            throw ServerError.http(status: http.statusCode, message: text.isEmpty ? "No details" : text, notices: [])
+            throw ServerError.http(status: http.statusCode, message: text.isEmpty ? "No details" : text, notices: [], code: nil)
         }
         do {
             return try JSONDecoder().decode(T.self, from: data)

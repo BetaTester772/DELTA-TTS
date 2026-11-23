@@ -55,6 +55,8 @@ final class VoiceRecorder {
 
     @ObservationIgnored private var task: Task<Void, Never>?
     @ObservationIgnored private var output: AVCaptureAudioFileOutput?
+    /// Called with each finished recording (after silence trimming).
+    @ObservationIgnored var onTake: ((Take) -> Void)?
 
     nonisolated static let directoryPrefix = "DeltaTTSDemo-recordings-"
 
@@ -211,7 +213,9 @@ final class VoiceRecorder {
         do {
             let analysis = try SilenceTrimmer.process(input: raw, output: final, trim: trimSilence)
             try? FileManager.default.removeItem(at: raw)
-            take = Take(url: final, duration: analysis.duration, peakDecibels: analysis.peakDecibels)
+            let take = Take(url: final, duration: analysis.duration, peakDecibels: analysis.peakDecibels)
+            self.take = take
+            onTake?(take)
         } catch {
             try? FileManager.default.removeItem(at: final)
             failure = error.localizedDescription

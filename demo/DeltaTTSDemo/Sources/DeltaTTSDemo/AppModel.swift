@@ -89,6 +89,20 @@ final class AppModel {
     private(set) var output: SynthesisOutput?
     private(set) var generationError: String?
     private(set) var lastTiming: String?  // for staff, in Settings; never on the main screen
+
+    /// Processing of the prompt on the server (/prepare), started as soon as a recording stops or a
+    /// sample voice is chosen, so that Generate only has to generate.
+    enum PrepareState: Equatable {
+        case idle
+        case preparing
+        case ready(id: String, seconds: Double)
+        case failed(String)
+    }
+
+    private(set) var prepareState = PrepareState.idle
+    private(set) var prepareNotices: [Notice] = []
+    @ObservationIgnored private var prepareToken = UUID()  // tags a prepare; a later one makes it stale
+    @ObservationIgnored private var preparedKey = ""  // the prompt, transcript and processing it was for
     private(set) var serverNotices: [Notice] = []
     private(set) var isResetting = false
     private(set) var readyForNextVisitor = false  // shown briefly after Next visitor
@@ -130,6 +144,7 @@ final class AppModel {
         self.config = config
         consentAcknowledged = UserDefaults.standard.bool(forKey: Self.consentKey)
         text = config.demo.defaultText
+        recorder.onTake = { [weak self] _ in self?.preparePrompt() }
         audioDevices.onDefaultOutputChange = { [weak self] in self?.defaultOutputChanged() }
         audioDevices.onChange = { [weak self] in self?.applyOutputRoute() }
         applyOutputRoute()
@@ -165,11 +180,75 @@ final class AppModel {
     func useSampleVoice(_ id: UUID) {
         promptPlayer.unload()
         selection = .preset(id)
+        preparePrompt()
     }
 
     func useOwnVoice() {
         promptPlayer.unload()
         selection = .recording
+        preparePrompt()
+    }
+
+    /// The prompt, transcript and processing a prepared prompt_id stands for.
+    private var promptKey: String {
+        let p = config.processing
+        return "\(promptURL?.path ?? "")|\(transcript)|\(p.enhancePrompt)\(p.trimPrompt)\(p.trimOutput)"
+    }
+
+    /// Start /prepare for the current prompt, in the background. A newer call, a new recording or
+    /// Next visitor makes it stale: its response is then dropped.
+    func preparePrompt() {
+        let token = UUID()
+        prepareToken = token
+        prepareNotices = []
+        guard let promptURL, let client else {
+            prepareState = .idle
+            return
+        }
+        preparedKey = promptKey
+        prepareState = .preparing
+        let p = config.processing
+        let promptText = transcript, warnings = config.warnings
+        let name = selection == .recording ? "recording.wav" : promptURL.lastPathComponent
+        Task {
+            do {
+                let audio = try Data(contentsOf: promptURL)
+                guard audio.count <= Self.maxUploadBytes else { throw PromptError.tooLarge(audio.count) }
+                let request = PrepareRequest(promptText: promptText, promptWavBase64: audio.base64EncodedString(),
+                                             promptWavName: name, enhancePrompt: p.enhancePrompt,
+                                             trimPrompt: p.trimPrompt, trimOutput: p.trimOutput, warnings: warnings)
+                let response = try await client.prepare(request)
+                guard token == prepareToken else { return }
+                prepareState = .ready(id: response.promptId, seconds: response.durationSeconds)
+                prepareNotices = response.warnings.filter { $0.level != .info }
+            } catch {
+                guard token == prepareToken else { return }
+                let notices = (error as? ServerError)?.notices.filter { $0.level != .info } ?? []
+                prepareNotices = notices.filter { $0.level != .error }
+                let reason = notices.first { $0.level == .error }?.message ?? error.localizedDescription
+                prepareState = .failed(reason)
+            }
+        }
+    }
+
+    /// Forget any prepare in progress or done (a new recording, Next visitor).
+    private func dropPrepare() {
+        prepareToken = UUID()
+        prepareState = .idle
+        prepareNotices = []
+        preparedKey = ""
+    }
+
+    /// Why the last /prepare failed (for staff, in a tooltip).
+    var prepareFailure: String? {
+        if case .failed(let reason) = prepareState { return reason }
+        return nil
+    }
+
+    /// The prompt_id to send instead of the audio, when the current prompt was prepared as it is now.
+    private var preparedID: String? {
+        guard case .ready(let id, _) = prepareState, preparedKey == promptKey else { return nil }
+        return id
     }
 
     /// Keep the selection valid after the presets change (edits in Settings, reset).
@@ -226,6 +305,7 @@ final class AppModel {
 
     func startRecording() {
         readyForNextVisitor = false
+        dropPrepare()
         promptPlayer.unload()
         player.stop()
         selection = .recording
@@ -429,18 +509,35 @@ final class AppModel {
         player.stop()
         promptPlayer.stop()
         do {
-            let audio = try Data(contentsOf: promptURL)
-            guard audio.count <= Self.maxUploadBytes else { throw PromptError.tooLarge(audio.count) }
             let s = config.synthesis, p = config.processing
-            let request = SynthesisRequest(
+            var request = SynthesisRequest(
                 text: text, promptText: transcript,
-                promptWavBase64: audio.base64EncodedString(),
-                promptWavName: selection == .recording ? "recording.wav" : promptURL.lastPathComponent,
                 lengthScale: s.lengthScale, numSteps: s.numSteps, temperature: s.temperature, topP: s.topP,
                 tShift: s.tShift, compute: s.compute,
                 enhancePrompt: p.enhancePrompt, trimPrompt: p.trimPrompt, trimOutput: p.trimOutput,
                 warnings: config.warnings)
-            let response = try await client.synthesize(request)
+            let name = selection == .recording ? "recording.wav" : promptURL.lastPathComponent
+            func attachAudio() throws {
+                let audio = try Data(contentsOf: promptURL)
+                guard audio.count <= Self.maxUploadBytes else { throw PromptError.tooLarge(audio.count) }
+                request.promptId = nil
+                request.promptWavBase64 = audio.base64EncodedString()
+                request.promptWavName = name
+            }
+            // Prepared: send the id. Still preparing or not prepared: send the audio; the server
+            // serializes it after a running /prepare, whose cached features it then reuses.
+            if let id = preparedID {
+                request.promptId = id
+            } else {
+                try attachAudio()
+            }
+            let response: SynthesisResponse
+            do {
+                response = try await client.synthesize(request)
+            } catch let error as ServerError where error.code == "prompt_unknown" {
+                try attachAudio()  // the server no longer knows the id (restarted, reset): send the audio
+                response = try await client.synthesize(request)
+            }
             guard visitor == self.visitor else { return }  // Next visitor was pressed meanwhile
             guard let wav = Data(base64Encoded: response.audioWavBase64) else {
                 throw ServerError.invalidResponse("the audio is not valid base64")
@@ -456,7 +553,7 @@ final class AppModel {
             guard visitor == self.visitor else { return }
             if let error = error as? ServerError {
                 serverNotices = error.notices.filter { $0.level != .error }
-                if case .http(_, let message, _) = error { generationError = message } else { generationError = error.localizedDescription }
+                if case .http(_, let message, _, _) = error { generationError = message } else { generationError = error.localizedDescription }
             } else {
                 generationError = error.localizedDescription
             }
@@ -478,7 +575,7 @@ final class AppModel {
     // The primary action: one button in a fixed place, changing with the state
     // -----------------------------
     enum PrimaryAction: Equatable {
-        case record, stopRecording, generate, generating, play, stopPlayback, nextVisitor, resetting
+        case record, stopRecording, generate, generating, play, playAgain, stopPlayback, resetting
 
         var title: String {
             switch self {
@@ -487,8 +584,8 @@ final class AppModel {
             case .generate: "Generate my voice"
             case .generating: "Generating..."
             case .play: "Play"
+            case .playAgain: "Play again"
             case .stopPlayback: "Stop"
-            case .nextVisitor: "Next visitor"
             case .resetting: "Clearing..."
             }
         }
@@ -498,8 +595,7 @@ final class AppModel {
             case .record: "mic.fill"
             case .stopRecording, .stopPlayback: "stop.fill"
             case .generate: "waveform"
-            case .play: "play.fill"
-            case .nextVisitor: "arrow.counterclockwise"
+            case .play, .playAgain: "play.fill"
             case .generating, .resetting: nil  // a progress indicator instead
             }
         }
@@ -508,14 +604,13 @@ final class AppModel {
             switch self {
             case .record, .stopRecording: "Space or \u{2318}R"
             case .generate: "Space, Return in the text or \u{2318}G"
-            case .play, .stopPlayback: "Space or \u{2318}P"
-            case .nextVisitor: "Space or \u{2318}N"
+            case .play, .playAgain, .stopPlayback: "Space or \u{2318}P"
             case .generating, .resetting: ""
             }
         }
     }
 
-    /// Record, then stop, generate, play, and start over for the next visitor.
+    /// Record, then stop, generate, play, and play again (Next visitor is a secondary action).
     var primaryAction: PrimaryAction {
         if isResetting { return .resetting }
         if recorder.isCapturing { return .stopRecording }
@@ -523,7 +618,7 @@ final class AppModel {
         if promptURL == nil { return .record }
         if outputIsCurrent {
             if player.isPlaying { return .stopPlayback }
-            return player.timesFinished > 0 ? .nextVisitor : .play
+            return player.timesFinished > 0 ? .playAgain : .play
         }
         return .generate
     }
@@ -533,7 +628,7 @@ final class AppModel {
         case .record: canRecord
         case .generate: blockingReason == nil
         case .generating, .resetting: false
-        case .stopRecording, .play, .stopPlayback, .nextVisitor: true
+        case .stopRecording, .play, .playAgain, .stopPlayback: true
         }
     }
 
@@ -543,8 +638,7 @@ final class AppModel {
         case .record: startRecording()
         case .stopRecording: stopRecording()
         case .generate: Task { await synthesize() }
-        case .play, .stopPlayback: toggleOutputPlayback()
-        case .nextVisitor: Task { await nextVisitor() }
+        case .play, .playAgain, .stopPlayback: toggleOutputPlayback()
         case .generating, .resetting: break
         }
     }
@@ -634,7 +728,7 @@ final class AppModel {
             if player.isPlaying {
                 return Instruction(text: "This is your voice.", level: .info, systemImage: "speaker.wave.2")
             }
-            return Instruction(text: "Done! Play it again, or press \"Next visitor\" when you are finished.",
+            return Instruction(text: "Play it again, or press \"Next visitor\" when you're done.",
                                level: .info, systemImage: "checkmark.circle")
         }
     }
@@ -645,6 +739,7 @@ final class AppModel {
     /// Delete the recording, ask the server to forget it, and start over with the defaults.
     func nextVisitor() async {
         visitor = UUID()
+        dropPrepare()
         recorder.deleteAll()
         recorder.refreshAccess()
         player.unload()
@@ -832,12 +927,27 @@ final class AppModel {
         return notices
     }
 
-    /// Client checks and the server's notices of the last request, minus dismissed ones. A
-    /// server notice is hidden when a client check reports the same thing (same code).
+    /// Notices about the recording itself, shown in step 1 next to the recording, so that a
+    /// visitor can record again right away.
+    nonisolated static let recordingCodes: Set<String> = [
+        "prompt_short", "prompt_long", "prompt_low_sample_rate", "prompt_unreadable", "prompt_no_speech",
+        "recording_silent", "audio_extra_missing",
+    ]
+
+    /// Step 1's notices: from /prepare, else from the last synthesis, else the app's own checks.
+    var recordingNotices: [Notice] {
+        var seen = Set<String>()
+        return (prepareNotices + serverNotices + clientNotices)
+            .filter { Self.recordingCodes.contains($0.code) && seen.insert($0.code).inserted }
+    }
+
+    /// Client checks and the server's notices of the last request, minus dismissed ones and the
+    /// recording's notices (in step 1). A server notice is hidden when a client check reports the
+    /// same thing (same code).
     var visibleNotices: [Notice] {
-        let client = clientNotices
+        let client = clientNotices.filter { !Self.recordingCodes.contains($0.code) }
         let codes = Set(client.map(\.code))
-        let server = serverNotices.filter { !codes.contains($0.code) }
+        let server = serverNotices.filter { !codes.contains($0.code) && !Self.recordingCodes.contains($0.code) }
         var seen = Set<String>()
         return (client + server)
             .filter { !dismissedNotices.contains($0.id) && seen.insert($0.id).inserted }

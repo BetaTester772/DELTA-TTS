@@ -41,8 +41,8 @@ struct DemoConfig: Codable, Equatable, Sendable {
     }
 
     struct Processing: Codable, Equatable, Sendable {
-        var enhancePrompt = false
-        var trimPrompt = false
+        var enhancePrompt = true  // RE-USE on the visitor's recording
+        var trimPrompt = true  // Silero VAD on the visitor's recording
         var trimOutput = false
     }
 
