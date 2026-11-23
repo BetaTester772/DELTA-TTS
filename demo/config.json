@@ -88,6 +88,8 @@
   },
   "app": {
     "ui_scale": 1.0,
-    "show_save_button": false
+    "show_save_button": false,
+    "output_device_uid": "",
+    "output_device_name": ""
   }
 }

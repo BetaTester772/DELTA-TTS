@@ -81,6 +81,8 @@ struct DemoConfig: Codable, Equatable, Sendable {
         var launchDryRun = false
         var uiScale = 1.0  // text and control size on the main screen
         var showSaveButton = false  // saved files are not deleted by Next visitor
+        var outputDeviceUid = ""  // empty: the system default output
+        var outputDeviceName = ""  // name of that device, for messages
     }
 
     var server = Server()
