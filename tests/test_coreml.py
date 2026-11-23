@@ -214,3 +214,40 @@ def test_wait_times_out_when_nothing_loads(forward: CoreMLForward) -> None:
     assert not forward.wait([8], timeout=0.05)
     forward.loader.ready[8] = StandInFunction(2.0)
     assert forward.wait([8], timeout=0.05)
+
+
+# -----------------------------
+# Background loading, with stand-in loads
+# -----------------------------
+
+
+def stand_in_loads(monkeypatch: pytest.MonkeyPatch, fail: dict[int, int]) -> list[int]:
+    """Replace the helper and in-process loads: bucket b fails its first fail[b] helper loads.
+    Returns the helper loads, in order."""
+    loads: list[int] = []
+
+    def load_in_helper(self: coreml._BucketLoader, bucket: int) -> float:
+        loads.append(bucket)
+        if loads.count(bucket) <= fail.get(bucket, 0):
+            raise RuntimeError("compiled program deleted")
+        return 0.0
+
+    monkeypatch.setattr(coreml._BucketLoader, "_load_in_helper", load_in_helper)
+    monkeypatch.setattr(coreml._BucketLoader, "_load", lambda self, bucket: f"function {bucket}")
+    monkeypatch.setattr(coreml._BucketLoader, "_stop_helper", lambda self: None)
+    return loads
+
+
+def test_failed_bucket_is_tried_again_after_the_others(monkeypatch: pytest.MonkeyPatch) -> None:
+    loads = stand_in_loads(monkeypatch, fail={16: 1})
+    loader = coreml._BucketLoader("unused", [16, 8])
+    assert loader.wait([16, 8], timeout=5)
+    assert loads == [16, 8, 16] and loader.ready == {16: "function 16", 8: "function 8"}
+
+
+def test_bucket_failing_twice_runs_in_float32(monkeypatch: pytest.MonkeyPatch) -> None:
+    loads = stand_in_loads(monkeypatch, fail={8: 2})
+    loader = coreml._BucketLoader("unused", [8, 16])
+    assert not loader.wait([8, 16], timeout=5)
+    assert loads == [8, 16, 8] and loader.failed == {8} and loader.get(8) is None
+    assert loader._queue == []  # a failed bucket is not queued again

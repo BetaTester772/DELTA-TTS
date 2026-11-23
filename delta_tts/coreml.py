@@ -373,6 +373,8 @@ class _BucketLoader:
     A helper process (the same interpreter, hence the same macOS cache) loads each function
     first, which compiles it if needed; this process then loads it from the cache. Loads run
     one at a time, as parallel loads are not faster. The helper exits when the queue is empty.
+    A failed bucket is tried once more after the others: on a nearly full disk, macOS can
+    delete a compiled program before Core ML loads it.
 
     Args:
         path: Compiled Core ML model.
@@ -383,6 +385,7 @@ class _BucketLoader:
         self.path = path
         self.ready: dict[int, Any] = {}  # bucket -> loaded function (ct.models.CompiledMLModel)
         self.failed: set[int] = set()
+        self._attempts: dict[int, int] = {}
         self._queue = list(queue)
         self._loading: int | None = None
         self._cond = threading.Condition()
@@ -424,13 +427,17 @@ class _BucketLoader:
                 helper_seconds = self._load_in_helper(bucket)
                 function = self._load(bucket)
                 logger.info("Core ML bucket %d ready in %.1f s (helper load %.1f s)", bucket, time.perf_counter() - start, helper_seconds)
-            except (OSError, RuntimeError, ValueError) as e:  # the bucket's utterances run in float32
-                logger.warning("Core ML bucket %d failed to load; its utterances run in float32: %s", bucket, e)
+            except (OSError, RuntimeError, ValueError) as e:
+                logger.warning("Core ML bucket %d failed to load%s: %s", bucket, " again; its utterances run in float32"
+                               if self._attempts.get(bucket) else ", trying again after the other buckets", e)
             with self._cond:
-                if function is None:
-                    self.failed.add(bucket)
-                else:
+                if function is not None:
                     self.ready[bucket] = function
+                elif self._attempts.get(bucket):
+                    self.failed.add(bucket)  # its utterances run in float32
+                else:
+                    self._attempts[bucket] = 1
+                    self._queue.append(bucket)
                 self._loading = None
                 self._cond.notify_all()
 
