@@ -11,6 +11,11 @@ struct DeltaTTSDemoApp: App {
                 .environment(appDelegate.model)
         }
         .defaultSize(width: 760, height: 860)
+
+        Settings {
+            SettingsView()
+                .environment(appDelegate.model)
+        }
     }
 }
 
