@@ -11,6 +11,7 @@ Endpoints (JSON)
     POST /prepare      prompt in; processes it (VAD trim, enhancement) and caches its features, so that
                        a later /synthesize with the returned prompt_id does no prompt processing
     POST /reset        forget the previous visitor: uploaded and prepared prompts, cached prompt features
+    GET  /progress     progress of the /synthesize or /prepare in flight: state, stage, step, fraction
 
 Every notice in "warnings" is {level: "info" | "warning" | "error", code, message}. A request
 that cannot be served gets an HTTP 4xx/5xx status and {error, code, warnings}.
@@ -34,6 +35,7 @@ import binascii
 import copy
 import hashlib
 import importlib.util
+import inspect
 import io
 import json
 import logging
@@ -77,8 +79,19 @@ AUDIO_ERRORS = (OSError, RuntimeError, EOFError, ValueError, ArithmeticError, wa
 
 DRY_RUN_SAMPLE_RATE = 24000
 DRY_RUN_LOAD_SECONDS = 1.0  # simulated model loading, so that clients see the "loading" state
-DRY_RUN_SYNTHESIS_SECONDS = 0.5  # simulated synthesis time
 DRY_RUN_PREPARE_SECONDS = 0.8  # simulated prompt processing
+# Simulated synthesis stages (step count, seconds per step), roughly as on an Apple Silicon Mac
+DRY_RUN_STAGES = {"prompt": (1, 0.4), "tokens": (16, 0.036), "acoustic": (10, 0.055), "vocoder": (1, 0.05)}
+
+# -----------------------------
+# Progress
+# -----------------------------
+STAGES = ("prompt", "tokens", "acoustic", "vocoder")
+# Expected stage durations, relative to a synthesis of 1: the measured shares of exact mode on an
+# Apple Silicon Mac (tokens 0.49, acoustic 0.47, vocoder 0.04) and a guess for the prompt stage,
+# which runs only when the prompt is not cached. Refined per compute mode by `STAGE_EMA`.
+STAGE_SECONDS = {"prompt": 0.5, "tokens": 0.49, "acoustic": 0.47, "vocoder": 0.04}
+STAGE_EMA = 0.3  # weight of the latest observed durations
 
 logger = logging.getLogger("demo.server")
 
@@ -561,6 +574,77 @@ def check_request(request: SynthesisRequest, notices: list[Notice]) -> float:
     return estimate
 
 
+class Progress:
+    """Progress of the request in flight, for GET /progress; thread-safe (it is updated from the
+    request's thread and read from others).
+
+    The overall fraction weights the stages by their expected durations, kept per compute mode
+    as an exponential moving average of the observed ones, so that the bar moves at an even pace.
+    It never goes backwards. Without per-step reports (a library without `progress`, or
+    /prepare) it stays indeterminate (fraction None).
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._seconds = {mode: dict(STAGE_SECONDS) for mode in COMPUTE_MODES}
+        self._request_id = 0
+        self._reset("idle", "exact")
+
+    def _reset(self, state: str, mode: str) -> None:
+        self._state, self._mode = state, mode
+        self._stage: str | None = None
+        self._step = self._total = 0
+        self._fraction: float | None = None
+        self._plan: list[str] = []  # the stages this request runs
+        self._started: dict[str, float] = {}  # stage -> time of its first report
+
+    def begin(self, state: str, mode: str) -> None:
+        """A /synthesize ("generating") or /prepare ("preparing") starts."""
+        with self._lock:
+            self._request_id += 1
+            self._reset(state, mode)
+
+    def update(self, stage: str, step: int, total: int) -> None:
+        """The library's progress callback: `stage` is at `step` of `total`."""
+        if stage not in STAGES:
+            return
+        with self._lock:
+            if not self._plan:
+                # The prompt stage reports first, and only when the prompt is not cached.
+                self._plan = list(STAGES) if stage == "prompt" else [s for s in STAGES if s != "prompt"]
+            if stage not in self._plan:
+                return
+            self._started.setdefault(stage, time.monotonic())
+            self._stage, self._step, self._total = stage, step, total
+            seconds = self._seconds[self._mode]
+            weights = [seconds[s] for s in self._plan]
+            index = self._plan.index(stage)
+            done = sum(weights[:index]) + weights[index] * (min(max(step, 0), total) / total if total > 0 else 0)
+            fraction = min(1.0, done / sum(weights))
+            self._fraction = fraction if self._fraction is None else max(self._fraction, fraction)
+
+    def end(self, success: bool) -> None:
+        """The request finished. On success, the observed stage durations refine the weights."""
+        with self._lock:
+            if success and len(self._started) == len(self._plan) > 0:
+                now = time.monotonic()
+                starts = [self._started[s] for s in self._plan] + [now]
+                seconds = self._seconds[self._mode]
+                elapsed = starts[-1] - starts[0]
+                scale = sum(seconds[s] for s in self._plan)  # keep the units of STAGE_SECONDS
+                if elapsed > 0:
+                    for stage, begin, end in zip(self._plan, starts, starts[1:], strict=False):
+                        observed = (end - begin) / elapsed * scale
+                        seconds[stage] = (1 - STAGE_EMA) * seconds[stage] + STAGE_EMA * observed
+            self._reset("idle", self._mode)
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            return {"state": self._state, "stage": self._stage, "step": self._step, "total": self._total,
+                    "fraction": None if self._fraction is None else round(self._fraction, 4),
+                    "request_id": self._request_id}
+
+
 # -----------------------------
 # Model
 # -----------------------------
@@ -587,6 +671,9 @@ class TTSService:
         self._lock = threading.Lock()  # one synthesis or prompt preparation at a time
         self.uploads = UploadStore()
         self.prepared = PreparedPrompts()
+        self.progress = Progress()
+        self._has_progress = False  # whether DeltaTTSPipeline.synthesize takes `progress`
+        self._dry_cache: set[Path] = set()  # prompts the dry run treats as cached
         # Directories that prompt_wav_path may point into
         preset_dirs = {resolve(preset["wav"]).resolve().parent for preset in config["presets"]}
         self.prompt_roots = [REPO_ROOT, self.uploads.dir, *sorted(preset_dirs - {REPO_ROOT})]
@@ -623,6 +710,8 @@ class TTSService:
                                     device=server.get("device"), compute=self.compute)
         self.device = str(self.tts.device)
         self.sample_rate = self.tts.sample_rate
+        self._has_progress = "progress" in inspect.signature(self.tts.synthesize).parameters
+        logger.info("Per-step progress from the pipeline: %s", "yes" if self._has_progress else "no (indeterminate)")
         if self.compute == "fast":
             self._fast_forward = self.tts.forward
 
@@ -654,6 +743,7 @@ class TTSService:
         with self._lock:
             removed = self.uploads.clear()
             forgotten = self.prepared.clear()
+            self._dry_cache.clear()
             cleared = 0
             if self.tts is not None:
                 cleared = len(self.tts._prompt_cache)
@@ -678,19 +768,26 @@ class TTSService:
         waits for the lock and then finds the cache warm."""
         self._check_ready()
         with self._lock:
-            prompt = parse_prompt(body, self.config, self.uploads, self.prompt_roots, self.prepared)
-            check_transcript(prompt.prompt_text, notices)
-            check_processing(prompt.processing)
-            seconds = check_prompt_audio(prompt, notices)
-            prompt_id = self.prepared.register(prompt.prompt_wav)
-            if self.dry_run:
-                time.sleep(DRY_RUN_PREPARE_SECONDS)
-                processed = seconds  # no trimming in the dry run
-                self.processing = prompt.processing
-                notices.append(notice("info", "dry_run_prepare",
-                                      "Dry run: the prompt is registered, but not trimmed or enhanced."))
-            else:
-                processed = self._prepare_model(prompt, notices)
+            self.progress.begin("preparing", self.compute)
+            success = False
+            try:
+                prompt = parse_prompt(body, self.config, self.uploads, self.prompt_roots, self.prepared)
+                check_transcript(prompt.prompt_text, notices)
+                check_processing(prompt.processing)
+                seconds = check_prompt_audio(prompt, notices)
+                prompt_id = self.prepared.register(prompt.prompt_wav)
+                if self.dry_run:
+                    time.sleep(DRY_RUN_PREPARE_SECONDS)
+                    processed = seconds  # no trimming in the dry run
+                    self._dry_set_processing(prompt.processing)
+                    self._dry_cache.add(prompt.prompt_wav)
+                    notices.append(notice("info", "dry_run_prepare",
+                                          "Dry run: the prompt is registered, but not trimmed or enhanced."))
+                else:
+                    processed = self._prepare_model(prompt, notices)
+                success = True
+            finally:
+                self.progress.end(success)
         limits = prompt.thresholds
         if processed < limits["min_prompt_seconds"] and not any(n["code"] == "prompt_short" for n in notices):
             notices.append(notice("warning", "prompt_short",
@@ -740,10 +837,16 @@ class TTSService:
         with self._lock:
             request = parse_request(body, self.config, self.uploads, self.prompt_roots, self.prepared)
             estimate = check_request(request, notices)
-            if self.dry_run:
-                pcm, elapsed, fell_back = self._synthesize_dry_run(request, estimate, notices)
-            else:
-                pcm, elapsed, fell_back = self._synthesize_model(request, notices)
+            self.progress.begin("generating", request.compute)
+            success = False
+            try:
+                if self.dry_run:
+                    pcm, elapsed, fell_back = self._synthesize_dry_run(request, estimate, notices)
+                else:
+                    pcm, elapsed, fell_back = self._synthesize_model(request, notices)
+                success = True
+            finally:
+                self.progress.end(success)
         duration = len(pcm) / 2 / self.sample_rate
         return {
             "audio_wav_base64": base64.b64encode(wav_bytes(pcm, self.sample_rate)).decode("ascii"),
@@ -761,14 +864,30 @@ class TTSService:
     def _synthesize_dry_run(self, request: SynthesisRequest, estimate: float,
                             notices: list[Notice]) -> tuple[bytes, float, bool]:
         start = time.perf_counter()
-        time.sleep(DRY_RUN_SYNTHESIS_SECONDS)
+        self._dry_set_processing(request.processing)
+        self.compute = request.compute
+        for stage, (steps, step_seconds) in DRY_RUN_STAGES.items():
+            if stage == "prompt" and request.prompt_wav in self._dry_cache:
+                continue  # cached, as after /prepare
+            if stage == "tokens":
+                steps = request.decoding["num_steps"]
+            self.progress.update(stage, 0, steps)
+            for step in range(1, steps + 1):
+                time.sleep(step_seconds)
+                self.progress.update(stage, step, steps)
+        self._dry_cache.add(request.prompt_wav)
         pcm = dry_run_tone(estimate, self.sample_rate)
         elapsed = time.perf_counter() - start
-        self.compute, self.processing = request.compute, request.processing
         notices.append(notice("info", "dry_run", "Dry run: the output is a tone as long as the estimated speech."))
-        if any(request.processing):
+        if any(request.processing[:2]):
             notices.append(notice("info", "dry_run_processing", "Dry run: prompt and output processing are not applied."))
         return pcm, elapsed, False
+
+    def _dry_set_processing(self, processing: tuple[bool, bool, bool]) -> None:
+        """The dry run's `_set_processing`: changed prompt processing invalidates its cache."""
+        if processing[:2] != self.processing[:2]:
+            self._dry_cache.clear()
+        self.processing = processing
 
     def _synthesize_model(self, request: SynthesisRequest, notices: list[Notice]) -> tuple[bytes, float, bool]:
         import torch
@@ -779,8 +898,9 @@ class TTSService:
                 self._set_compute(request.compute)
                 self._set_processing(request.processing)
                 start = time.perf_counter()
+                extra = {"progress": self.progress.update} if self._has_progress else {}
                 wav = self.tts.synthesize(request.text, str(request.prompt_wav), request.prompt_text,
-                                          length_scale=request.length_scale, **request.decoding)  # (1, num_samples)
+                                          length_scale=request.length_scale, **request.decoding, **extra)  # (1, num_samples)
                 elapsed = time.perf_counter() - start
         finally:  # the library's warnings are reported also when synthesis fails
             fell_back = bool(getattr(self.tts.forward, "in_fallback", False))
@@ -852,6 +972,8 @@ class Handler(BaseHTTPRequestHandler):
             self._check_client()
             if path == "/health":
                 payload = self.service.health()
+            elif path == "/progress":
+                payload = self.service.progress.snapshot()
             elif path == "/config":
                 payload = self.service.public_config()
             else:
@@ -940,7 +1062,7 @@ class Handler(BaseHTTPRequestHandler):
             logger.info("The client closed the connection before the response")
 
     def log_message(self, format: str, *args: Any) -> None:
-        level = logging.DEBUG if getattr(self, "path", "").startswith("/health") else logging.INFO
+        level = logging.DEBUG if getattr(self, "path", "").startswith(("/health", "/progress")) else logging.INFO
         logger.log(level, "%s %s", self.address_string(), format % args)
 
 
