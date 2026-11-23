@@ -2,7 +2,7 @@
 
 The model is loaded once, in a background thread, and requests are synthesized one at a time.
 Run from the repository root:
-    uv run python demo/server.py [--config demo/config.json] [--dry-run]
+    uv run --extra mac --extra audio python demo/server.py [--config demo/config.json] [--dry-run]
 
 Endpoints (JSON)
     GET  /health       status ("loading", "ready" or "error"), device, compute, sample_rate, dry_run, the

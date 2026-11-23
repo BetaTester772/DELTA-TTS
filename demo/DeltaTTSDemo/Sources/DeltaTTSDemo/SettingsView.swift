@@ -63,7 +63,7 @@ struct GeneralSettings: View {
             } header: {
                 Text("Voice engine (server)")
             } footer: {
-                Text("Start Server runs `uv run python demo/server.py --config <this app's config>` in the repository; it stops when the app quits. A server started in a terminal is used as well.")
+                Text("Start Server runs `uv run --extra mac --extra audio python demo/server.py --config <this app's config>` in the repository; it stops when the app quits. A server started in a terminal is used as well.")
             }
 
             Section {

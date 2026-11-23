@@ -1,8 +1,10 @@
 import Foundation
 import Observation
 
-/// demo/server.py started by the app as `uv run python demo/server.py`, with its output kept
-/// for the log view.
+/// demo/server.py started by the app as `uv run --extra mac --extra audio python demo/server.py`,
+/// with its output kept for the log view. The extras matter: without `mac`, macOS has no
+/// onnxruntime (the server cannot start) and no coremltools (no Neural Engine); without `audio`,
+/// no Silero VAD or RE-USE. `uv run` installs them if they are missing.
 @MainActor
 @Observable
 final class ServerProcess {
@@ -20,7 +22,8 @@ final class ServerProcess {
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: uv)
-        process.arguments = ["run", "python", "demo/server.py", "--config", configURL.path] + (dryRun ? ["--dry-run"] : [])
+        process.arguments = ["run", "--extra", "mac", "--extra", "audio", "python", "demo/server.py",
+                             "--config", configURL.path] + (dryRun ? ["--dry-run"] : [])
         process.currentDirectoryURL = URL(fileURLWithPath: repoPath, isDirectory: true)
         // An app started from Finder gets a minimal PATH; uv and FFmpeg are usually in Homebrew's.
         var environment = ProcessInfo.processInfo.environment

@@ -134,11 +134,13 @@ It talks to a small local server, `demo/server.py`, which keeps the model loaded
 Both read `demo/config.json`: server settings, the header titles, the sentence to read and the default text, recording settings, sample voices (the prompts of the demo page), synthesis and processing defaults, and warning thresholds.
 
 ```bash
-uv run python demo/server.py              # loads the model; GET /health reports "loading", then "ready"
-uv run python demo/server.py --dry-run    # no model: returns a tone of the estimated output length
-demo/DeltaTTSDemo/make_app.sh             # builds demo/DeltaTTSDemo/build/DeltaTTSDemo.app
+uv run --extra mac --extra audio python demo/server.py            # loads the model; GET /health reports "loading", then "ready"
+uv run --extra mac --extra audio python demo/server.py --dry-run  # no model: returns a tone of the estimated output length
+demo/DeltaTTSDemo/make_app.sh                                     # builds demo/DeltaTTSDemo/build/DeltaTTSDemo.app
 open demo/DeltaTTSDemo/build/DeltaTTSDemo.app
 ```
+
+The server needs both extras: without `mac`, macOS has no onnxruntime (the server cannot start) and no coremltools (no Neural Engine), and without `audio` there is no Silero VAD or RE-USE. The app's "Start local server" runs the same command.
 
 - Use the app bundle: macOS grants microphone access only to apps whose Info.plist explains it. `make_app.sh` builds the release binary, writes that Info.plist and signs the bundle ad hoc; macOS asks for the microphone on the first recording (if access was denied, allow DeltaTTSDemo in System Settings > Privacy & Security > Microphone). A rebuilt bundle may be asked again. `swift run` in `demo/DeltaTTSDemo` also works, with sample voices only.
 - The main screen shows four steps as a guide: read and record (a countdown, then the sentence shown large while recording, up to 12 s), type what to say, generate, listen. One button in a fixed place at the bottom does the next thing: Record your voice, Stop, Generate my voice, Play, Play again; Re-record, Play my recording and Edit text sit beside it. Shortcuts: Space (the next step, when no text field has focus), Command-R record or stop, Command-G or Return in the text generate, Command-P play, Command-N next visitor.
