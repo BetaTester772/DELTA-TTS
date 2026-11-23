@@ -515,6 +515,18 @@ final class AppModel {
         }
     }
 
+    /// Regenerate is offered once the voice matches the current prompt and text, and the prompt is
+    /// prepared: it then sends only the prompt_id, so it measures the generation alone.
+    var canRegenerate: Bool {
+        outputIsCurrent && !isSynthesizing && preparedID != nil && blockingReason == nil
+    }
+
+    /// Generate the voice again from the same prepared prompt and text, and play it (Command-G).
+    func regenerate() {
+        guard canRegenerate else { return }
+        generate()
+    }
+
     /// Generate in a task the model owns, so that Next visitor can cancel it.
     func generate() {
         guard !isSynthesizing else { return }
@@ -596,6 +608,7 @@ final class AppModel {
             } catch let error as ServerError where error.code == "prompt_unknown" {
                 try attachAudio()  // the server no longer knows the id (restarted, reset): send the audio
                 response = try await client.synthesize(request)
+                if visitor == self.visitor { preparePrompt() }  // a fresh id for the next Regenerate
             }
             guard visitor == self.visitor else { return }  // Next visitor was pressed meanwhile
             guard let wav = Data(base64Encoded: response.audioWavBase64) else {
@@ -603,7 +616,7 @@ final class AppModel {
             }
             try player.load(data: wav)
             output = SynthesisOutput(wav: wav, response: response, inputKey: key)
-            lastTiming = Self.timingSummary(response)
+            lastTiming = Self.timingSummary(response, preparedPrompt: request.promptId != nil)
             print("[synthesis] \(lastTiming ?? "")")
             serverNotices = response.warnings
             attemptedWithoutInput = false
@@ -621,8 +634,9 @@ final class AppModel {
 
     /// Timing of a generation, for staff only (Settings > General and the app's standard output):
     /// "1.8 s of speech in 0.52 s, RTF 0.29, exact".
-    static func timingSummary(_ response: SynthesisResponse) -> String {
+    static func timingSummary(_ response: SynthesisResponse, preparedPrompt: Bool) -> String {
         var summary = String(format: "%.2f s of speech in %.2f s", response.durationSeconds, response.elapsedSeconds)
+        summary += preparedPrompt ? " (prepared prompt)" : " (prompt sent with the request)"
         if let rtf = response.rtf { summary += String(format: ", RTF %.3f", rtf) }
         if let compute = response.compute { summary += ", \(compute)" }
         if response.fellBack == true { summary += " (fell back to float32)" }

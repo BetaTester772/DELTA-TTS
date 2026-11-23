@@ -725,9 +725,14 @@ struct ActionBar: View {
         }
     }
 
-    /// Right of the primary button: listen to the recording or play the voice again, edit the text.
+    /// Right of the primary button: regenerate the voice, listen to the recording, edit the text.
     @ViewBuilder private var trailing: some View {
         if canChangeRecording, model.promptURL != nil {
+            if model.canRegenerate {
+                SecondaryButton(title: "Regenerate", systemImage: "arrow.clockwise",
+                                help: "Generate your voice again from the same recording and text (\u{2318}G)",
+                                action: model.regenerate)
+            }
             if !model.outputIsCurrent {
                 switch model.prepareState {
                 case .preparing:

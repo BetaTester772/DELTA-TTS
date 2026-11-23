@@ -27,7 +27,7 @@ struct DeltaTTSDemoApp: App {
                 Divider()
                 Button("Record or stop") { appDelegate.model.toggleRecording() }
                     .keyboardShortcut("r", modifiers: .command)
-                Button("Generate my voice") { appDelegate.model.generate() }
+                Button("Generate or regenerate my voice") { appDelegate.model.generate() }
                     .keyboardShortcut("g", modifiers: .command)
                 Button("Play or stop") { appDelegate.model.toggleOutputPlayback() }
                     .keyboardShortcut("p", modifiers: .command)
