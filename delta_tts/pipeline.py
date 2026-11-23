@@ -27,6 +27,7 @@ import torch
 from delta_tts.duration import estimate_speech_len
 from delta_tts.generate import generate
 from delta_tts.model import DeltaTTS
+from delta_tts.precision import ReducedPrecisionForward
 
 COSYVOICE_DIR = Path(__file__).resolve().parent.parent / "third_party" / "CosyVoice"
 sys.path.insert(0, str(COSYVOICE_DIR))
@@ -65,14 +66,21 @@ class DeltaTTSPipeline:
         device: Torch device for DELTA-TTS and the CosyVoice 3 decoder. `default_device()` when None.
         audio_processor: Optional `delta_tts.audio.AudioProcessor` (Silero VAD, RE-USE) applied
             to the prompt before and to the output after synthesis.
+        compute: "exact" runs DELTA-TTS in float32. "fast" runs it in `fast_dtype` with a
+            float32 fallback on overflow (delta_tts/precision.py); its outputs differ numerically.
+        fast_dtype: Reduced precision of the fast mode.
     """
 
     def __init__(self, backbone_dir: str, checkpoint: str, device: str | None = None,
-                 audio_processor: "AudioProcessor | None" = None) -> None:
+                 audio_processor: "AudioProcessor | None" = None, compute: str = "exact",
+                 fast_dtype: torch.dtype = torch.float16) -> None:
+        if compute not in ("exact", "fast"):
+            raise ValueError(f"compute must be 'exact' or 'fast', got {compute!r}")
         self.device = torch.device(device or default_device())
         self.model = DeltaTTS(backbone_dir).to(self.device).float().eval()
         self.model.load_checkpoint(checkpoint)
         self.model.merge_lora()
+        self.forward = ReducedPrecisionForward(self.model, fast_dtype) if compute == "fast" else self.model
         with warnings.catch_warnings():
             # The CosyVoice config imports pyworld, which imports pkg_resources; setuptools 80
             # (used on macOS) warns about that import.
@@ -122,7 +130,9 @@ class DeltaTTSPipeline:
         # -----------------------------
         # 3. DELTA-TTS: speech tokens by iterative unmasking
         # -----------------------------
-        speech_token = generate(self.model, text_token, prompt_speech_token, speech_len, **decoding)  # (1, speech_len)
+        if isinstance(self.forward, ReducedPrecisionForward):
+            self.forward.reset()
+        speech_token = generate(self.forward, text_token, prompt_speech_token, speech_len, **decoding)  # (1, speech_len)
 
         # -----------------------------
         # 4. CosyVoice 3 flow decoder and vocoder

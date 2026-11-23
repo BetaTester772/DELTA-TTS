@@ -164,7 +164,7 @@ class DeltaTTS(nn.Module):
         layers = peft_model.get_base_model().model.layers
         self.conv_modules = nn.ModuleList([ConvModule() for _ in layers])
         for layer, conv in zip(layers, self.conv_modules):
-            layer.register_forward_hook(_apply_after_block(conv))
+            layer.register_forward_hook(_AfterBlock(conv))
 
         # 5. Learned [MASK] embedding (loaded from delta_tts.pt).
         self.mask_embedding = nn.Parameter(torch.zeros(1, HIDDEN_DIM))  # (1, hidden_dim)
@@ -223,14 +223,19 @@ class DeltaTTS(nn.Module):
         return self.llm_decoder(hidden)  # (1, seq_len, vocab_size)
 
 
-def _apply_after_block(conv: ConvModule):
-    """Forward hook that replaces a transformer block's hidden-state output with conv(output)."""
+class _AfterBlock:
+    """Forward hook that replaces a transformer block's hidden-state output with conv(output).
 
-    def hook(module: nn.Module, inputs: tuple, output: tuple) -> tuple:
+    A class rather than a closure, so that `copy.deepcopy` of the model points the copied hooks
+    at the copied ConvModules.
+    """
+
+    def __init__(self, conv: ConvModule) -> None:
+        self.conv = conv
+
+    def __call__(self, module: nn.Module, inputs: tuple, output: tuple) -> tuple:
         hidden_states = output[0]  # (batch_size, seq_len, hidden_dim); the rest of the tuple is passed through
-        return (conv(hidden_states),) + tuple(output[1:])
-
-    return hook
+        return (self.conv(hidden_states),) + tuple(output[1:])
 
 
 def _load_cosyvoice_llm(path: str, qwen2: nn.Module, speech_embedding: nn.Module, llm_decoder: nn.Module) -> None:

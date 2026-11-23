@@ -72,6 +72,8 @@ uv run python infer.py --meta third_party/F5-TTS/data/seedtts_testset/en/meta.ls
 
 The output length is estimated with the length rule of [OmniVoice](https://github.com/k2-fsa/OmniVoice).
 
+`--compute exact` (default) runs DELTA-TTS in float32. `--compute fast` runs it in float16; a step whose float16 logits overflow (inf/NaN) is recomputed in float32 and the rest of that utterance stays in float32. Fast-mode outputs differ numerically from exact ones.
+
 With the `audio` extra, the prompt can be cleaned before synthesis and the output trimmed after it (all off by default; the paper results use none):
 
 | Flag | Effect |

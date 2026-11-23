@@ -15,19 +15,27 @@ How generation works
     when little context is available, and more positions in later steps.
 """
 
+from typing import Protocol
+
 import torch
 import torch.nn.functional as F
 
-from delta_tts.model import EOS_TOKEN, MASK_TOKEN, SPEECH_TOKEN_SIZE, DeltaTTS
+from delta_tts.model import EOS_TOKEN, MASK_TOKEN, SPEECH_TOKEN_SIZE
 
 __all__ = ["generate", "top_p_filter", "unmask_schedule"]
 
 MAX_REPEAT = 3
 
 
+class LogitsModel(Protocol):
+    """What `generate` needs: `DeltaTTS`, or `ReducedPrecisionForward` for the fast mode."""
+
+    def logits(self, text_token: torch.Tensor, speech_token: torch.Tensor) -> torch.Tensor: ...
+
+
 @torch.no_grad()
 def generate(
-    model: DeltaTTS,
+    model: LogitsModel,
     text_token: torch.Tensor,
     prompt_speech_token: torch.Tensor,
     speech_len: int,
@@ -39,7 +47,7 @@ def generate(
     """Generate `speech_len` speech tokens by iterative unmasking.
 
     Args:
-        model: DELTA-TTS model in eval mode.
+        model: DELTA-TTS model in eval mode (anything with its `logits` method).
         text_token: Text token ids of [instruction, prompt transcript, target text]. Shape: (1, text_len)
         prompt_speech_token: Speech tokens of the prompt audio. Shape: (1, prompt_len)
         speech_len: Number of speech tokens to generate (25 tokens per second).
