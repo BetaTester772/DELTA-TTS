@@ -194,9 +194,44 @@ struct DeviceStrip: View {
                 .labelsHidden()
                 .controlSize(.small)
                 .fixedSize()
+                .help(model.fastModeHelp)
+                FastBackendStatus()
             }
         }
         .scaledFont(TypeSize.caption)
+    }
+}
+
+/// After "Fast", for staff: warming up (with the compiled share), "Ready" briefly, or
+/// "Unavailable" with the reason in the help text. Nothing in exact mode.
+struct FastBackendStatus: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.uiScale) private var scale
+
+    var body: some View {
+        switch model.fastBackendDisplay {
+        case .hidden:
+            EmptyView()
+        case .warming(let ready, let total):
+            HStack(spacing: 5 * scale) {
+                ProgressView().controlSize(.mini)
+                if let ready, let total, total > 0 {
+                    Text("Warming up \(ready)/\(total)").monospacedDigit()
+                } else {
+                    Text("Warming up")
+                }
+            }
+            .foregroundStyle(Theme.secondaryText)
+            .help(model.fastModeHelp)
+        case .ready:
+            Text("Ready")
+                .foregroundStyle(Theme.accent)
+                .transition(.opacity)
+        case .unavailable(let reason):
+            Text("Unavailable")
+                .foregroundStyle(Theme.error)
+                .help(reason)
+        }
     }
 }
 
@@ -693,20 +728,29 @@ struct ActionBar: View {
 
     var body: some View {
         // No GlassEffectContainer: it would blend the neutral buttons into the tinted primary one.
-        HStack(spacing: 28 * scale) {
-            HStack(spacing: 16 * scale) {
-                if showNextVisitor {
-                    // At the far edge, away from the primary button, so it is not hit by accident.
-                    NextVisitorButton(compact: false)
+        VStack(spacing: 6 * scale) {
+            HStack(spacing: 28 * scale) {
+                HStack(spacing: 16 * scale) {
+                    if showNextVisitor {
+                        // At the far edge, away from the primary button, so it is not hit by accident.
+                        NextVisitorButton(compact: false)
+                    }
+                    Spacer(minLength: 0)
+                    leading
                 }
-                Spacer(minLength: 0)
-                leading
+                .frame(maxWidth: .infinity)
+                PrimaryButton()
+                HStack(spacing: 16 * scale) { trailing }
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
-            .frame(maxWidth: .infinity)
-            PrimaryButton()
-            HStack(spacing: 16 * scale) { trailing }
-                .frame(maxWidth: .infinity, alignment: .leading)
+            if model.fastBackendWarming {
+                Text("Warming up. The first voices may take a little longer.")
+                    .scaledFont(TypeSize.caption)
+                    .foregroundStyle(Theme.tertiaryText)
+                    .transition(.opacity)
+            }
         }
+        .animation(.smooth, value: model.fastBackendWarming)
         .padding(.horizontal, 32 * scale)
         .padding(.vertical, 14 * scale)
         .frame(maxWidth: .infinity)

@@ -32,12 +32,78 @@ struct Health: Decodable, Equatable, Sendable {
     var sampleRate: Int?
     var dryRun: Bool
     var busy: Bool?
+    var backend: BackendStatus?  // nil when the server or the pipeline does not report it
+    var timing: [String: ModeTiming]?  // per compute mode, measured on this machine
 
     enum CodingKeys: String, CodingKey {
-        case status, error, device, compute, busy
+        case status, error, device, compute, busy, backend, timing
         case sampleRate = "sample_rate"
         case dryRun = "dry_run"
     }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        status = try c.decode(String.self, forKey: .status)
+        error = try c.decodeIfPresent(String.self, forKey: .error)
+        device = try c.decodeIfPresent(String.self, forKey: .device)
+        compute = try c.decodeIfPresent(String.self, forKey: .compute)
+        sampleRate = try c.decodeIfPresent(Int.self, forKey: .sampleRate)
+        dryRun = try c.decodeIfPresent(Bool.self, forKey: .dryRun) ?? false
+        busy = try c.decodeIfPresent(Bool.self, forKey: .busy)
+        // An optional display: a field the app does not understand must not break /health.
+        backend = try? c.decodeIfPresent(BackendStatus.self, forKey: .backend)
+        timing = try? c.decodeIfPresent([String: ModeTiming].self, forKey: .timing)
+    }
+}
+
+/// Clean generations of one compute mode on the server (generation stages only, no fallback,
+/// backend ready).
+struct ModeTiming: Decodable, Equatable, Sendable {
+    var generationSeconds: Double?  // median
+    var generationPerOutputSecond: Double?  // median, comparable across texts
+    var count: Int
+
+    enum CodingKeys: String, CodingKey {
+        case generationSeconds = "generation_s"
+        case generationPerOutputSecond = "generation_per_output_s"
+        case count = "n"
+    }
+}
+
+/// The generation backend's readiness (`DeltaTTSPipeline.backend_status()`), e.g. the fast
+/// mode's Neural Engine functions compiling in the background. Every field is optional.
+struct BackendStatus: Decodable, Equatable, Sendable {
+    var backend: String?  // "neural_engine", "float16" or "float32"
+    var state: String?  // "loading", "compiling", "ready" or "failed"
+    var readyBuckets: Int?
+    var totalBuckets: Int?
+    var maxReadyLen: Int?
+    var failedBuckets: Int?  // how many
+    var error: String?
+
+    enum CodingKeys: String, CodingKey {
+        case backend, state, error
+        case readyBuckets = "ready_buckets"
+        case totalBuckets = "total_buckets"
+        case maxReadyLen = "max_ready_len"
+        case failedBuckets = "failed_buckets"
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        backend = try? c.decodeIfPresent(String.self, forKey: .backend)
+        state = try? c.decodeIfPresent(String.self, forKey: .state)
+        readyBuckets = try? c.decodeIfPresent(Int.self, forKey: .readyBuckets)
+        totalBuckets = try? c.decodeIfPresent(Int.self, forKey: .totalBuckets)
+        maxReadyLen = try? c.decodeIfPresent(Int.self, forKey: .maxReadyLen)
+        failedBuckets = (try? c.decodeIfPresent([AnyJSON].self, forKey: .failedBuckets))?.count
+        error = try? c.decodeIfPresent(String.self, forKey: .error)
+    }
+}
+
+/// Any JSON value, ignored (to count the elements of an array whose shape may change).
+private struct AnyJSON: Decodable {
+    init(from decoder: Decoder) throws {}
 }
 
 /// POST /synthesize body. Keys are encoded as snake_case. The prompt is either `promptId` (from
@@ -182,6 +248,11 @@ struct ServerClient: Sendable {
 
     func synthesize(_ body: SynthesisRequest) async throws -> SynthesisResponse {
         try await post("synthesize", body, timeout: 900, as: SynthesisResponse.self)  // long texts on a slow device
+    }
+
+    /// Switch the server's compute mode now (it starts warming up the fast backend).
+    func setCompute(_ mode: ComputeMode) async throws -> Health {
+        try await post("compute", ["compute": mode.rawValue], timeout: 120, as: Health.self)
     }
 
     func progress() async throws -> ProgressSnapshot {

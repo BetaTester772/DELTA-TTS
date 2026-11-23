@@ -125,6 +125,10 @@ final class AppModel {
         didSet { UserDefaults.standard.set(consentAcknowledged, forKey: Self.consentKey) }
     }
 
+    /// demo.fast_speedup_percent of the repository's demo/config.json, read at launch: the fallback
+    /// when this app's own config has none (it is set there after a controlled measurement).
+    private let repoFastSpeedupPercent: Double?
+
     nonisolated static let consentKey = "voiceCloningNoticeAcknowledged"
     nonisolated static let maxUploadBytes = 18 * 1024 * 1024  // MAX_UPLOAD_BYTES of demo/server.py
 
@@ -151,6 +155,7 @@ final class AppModel {
             config.app.repoPath = repo
         }
         self.config = config
+        repoFastSpeedupPercent = (try? ConfigStore.loadRepoDefaults(repoPath: config.app.repoPath))?.demo.fastSpeedupPercent
         consentAcknowledged = UserDefaults.standard.bool(forKey: Self.consentKey)
         text = config.demo.defaultText
         recorder.onTake = { [weak self] _ in self?.preparePrompt() }
@@ -425,6 +430,119 @@ final class AppModel {
         set {
             config.synthesis.compute = newValue
             config.server.compute = newValue
+            syncServerCompute()
+        }
+    }
+
+    // -----------------------------
+    // The fast backend's warm-up
+    // -----------------------------
+    /// What the header shows after "Fast" (nothing in exact mode or when the server does not report it).
+    enum FastBackendDisplay: Equatable {
+        case hidden
+        case warming(ready: Int?, total: Int?)
+        case ready
+        case unavailable(String)
+    }
+
+    @ObservationIgnored private var computeSwitchInFlight = false
+    @ObservationIgnored private var computeEndpointMissing = false  // an older server without POST /compute
+    private(set) var fastBackendJustReady = false  // shows "Ready" for a few seconds
+
+    var fastBackendDisplay: FastBackendDisplay {
+        guard config.synthesis.compute == .fast, serverState == .ready, let health, let backend = health.backend else {
+            return .hidden
+        }
+        guard health.compute == ComputeMode.fast.rawValue else { return .warming(ready: nil, total: nil) }  // switching
+        switch backend.state ?? "" {
+        case "idle", "loading", "compiling":
+            return .warming(ready: backend.readyBuckets, total: backend.totalBuckets)
+        case "failed":
+            let failed = backend.failedBuckets.map { " \($0) of \(backend.totalBuckets ?? $0) lengths could not be loaded." } ?? ""
+            return .unavailable((backend.error ?? "The fast backend failed to prepare.") + failed
+                                + " Voices are still generated, more slowly, in exact precision.")
+        case "ready":
+            return fastBackendJustReady ? .ready : .hidden
+        default:
+            return .hidden
+        }
+    }
+
+    /// The Mode control's tooltip: how much faster Fast is, and that its voice can differ.
+    /// Measured on this Mac once both modes have 3 clean generations, else the configured value
+    /// (`demo.fast_speedup_percent`, from a controlled measurement), else no number.
+    var fastModeHelp: String {
+        let onGPU = health?.backend?.backend == "float16"
+        var text = "Fast runs DELTA-TTS " + (onGPU ? "on the GPU" : "on the Neural Engine") + " in reduced precision. "
+        if let percent = liveFastSpeedupPercent {
+            text += percent >= 5 ? "On this Mac: about \(percent)% faster generation." : "Speed depends on this Mac."
+        } else if let configured = config.demo.fastSpeedupPercent ?? repoFastSpeedupPercent {
+            let percent = Self.roundedToFive(configured)
+            text += percent >= 5 ? "About \(percent)% faster generation (measured on an M4 Pro)." : "Speed depends on this Mac."
+        } else {
+            text += "Faster generation " + (onGPU ? "on the GPU." : "on the Neural Engine.")
+        }
+        return text + " The voice can differ slightly from Exact."
+    }
+
+    /// (1 - fast/exact) x 100 from the server's clean generations, by generation time per second
+    /// of output, rounded to 5%; nil until both modes have at least 3.
+    var liveFastSpeedupPercent: Int? {
+        guard let exact = health?.timing?["exact"], let fast = health?.timing?["fast"],
+              exact.count >= 3, fast.count >= 3,
+              let e = exact.generationPerOutputSecond, let f = fast.generationPerOutputSecond, e > 0 else { return nil }
+        return Self.roundedToFive((1 - f / e) * 100)
+    }
+
+    private static func roundedToFive(_ percent: Double) -> Int {
+        Int((percent / 5).rounded()) * 5
+    }
+
+    /// The fast mode is selected and its backend is still warming up (shown to visitors).
+    var fastBackendWarming: Bool {
+        if case .warming = fastBackendDisplay { return true }
+        return false
+    }
+
+    /// For staff, in Settings: "neural_engine, compiling 3/6, ready up to 300 tokens".
+    var backendSummary: String? {
+        guard let backend = health?.backend else { return nil }
+        var parts = [backend.backend, backend.state].compactMap { $0 }
+        if let ready = backend.readyBuckets, let total = backend.totalBuckets, total > 0 { parts.append("\(ready)/\(total)") }
+        if let length = backend.maxReadyLen { parts.append("ready up to \(length) tokens") }
+        if let failed = backend.failedBuckets, failed > 0 { parts.append("\(failed) failed") }
+        if let error = backend.error { parts.append(error) }
+        return parts.joined(separator: ", ")
+    }
+
+    /// Ask the server to use the selected compute mode now, so that the fast backend warms up
+    /// before a visitor's first generation.
+    func syncServerCompute() {
+        guard let client, let health, health.status == "ready", health.compute != config.synthesis.compute.rawValue,
+              !isSynthesizing, !computeSwitchInFlight, !computeEndpointMissing else { return }
+        computeSwitchInFlight = true
+        let mode = config.synthesis.compute
+        Task {
+            defer { computeSwitchInFlight = false }
+            do {
+                applyHealth(try await client.setCompute(mode))
+            } catch let error as ServerError where error.code == "not_found" {
+                computeEndpointMissing = true  // the next request switches it instead
+            } catch {}
+        }
+    }
+
+    /// Take a /health result; note the fast backend becoming ready, to show "Ready" briefly.
+    private func applyHealth(_ new: Health) {
+        let wasWarming = health?.backend.map { ["idle", "loading", "compiling"].contains($0.state ?? "") } ?? false
+        health = new
+        healthError = nil
+        if wasWarming, new.backend?.state == "ready", new.compute == ComputeMode.fast.rawValue {
+            fastBackendJustReady = true
+            Task {
+                try? await Task.sleep(for: .seconds(4))
+                fastBackendJustReady = false
+            }
         }
     }
 
@@ -453,7 +571,7 @@ final class AppModel {
     func pollHealth() async {
         while !Task.isCancelled {
             await refreshHealth()
-            try? await Task.sleep(for: .seconds(serverState == .ready ? 5 : 1))
+            try? await Task.sleep(for: .seconds(serverState == .ready && !fastBackendWarming ? 5 : 1))
         }
     }
 
@@ -464,8 +582,8 @@ final class AppModel {
             return
         }
         do {
-            health = try await client.health()
-            healthError = nil
+            applyHealth(try await client.health())
+            syncServerCompute()
         } catch let error as ServerError {
             health = nil
             if case .unreachable = error { healthError = "not reachable" } else { healthError = error.localizedDescription }

@@ -35,6 +35,9 @@ struct GeneralSettings: View {
             Section {
                 LabeledContent("Status", value: engineStatus)
                 LabeledContent("Last generation", value: model.lastTiming ?? "None yet")
+                if let backend = model.backendSummary {
+                    LabeledContent("Generation backend", value: backend)
+                }
                 HStack {
                     if model.serverProcess.isRunning {
                         Button("Stop Server", systemImage: "stop.circle") { model.serverProcess.stop() }
@@ -177,6 +180,8 @@ struct DemoSettings: View {
                     .lineLimit(2...4)
                 TextField("Text to say", text: $model.config.demo.defaultText, axis: .vertical)
                     .lineLimit(2...4)
+                TextField("Fast mode speedup (%)", value: $model.config.demo.fastSpeedupPercent, format: .number,
+                          prompt: Text("Measured on this Mac when available"))
             } header: {
                 Text("Defaults")
             } footer: {
@@ -421,7 +426,7 @@ struct SynthesisSettings: View {
             } header: {
                 Text("Compute mode")
             } footer: {
-                Text("Exact runs DELTA-TTS in float32 and reproduces the paper. Fast runs it in float16: faster, with numerically different outputs (a step that overflows is redone in float32). Also on the main screen as Mode.")
+                Text("Exact runs DELTA-TTS in float32 and reproduces the paper. Fast runs it on the Neural Engine (in float16 on the GPU without the exported Core ML model): faster, with numerically different outputs. Until the Neural Engine has loaded, and for a step that overflows, it runs in float32. Also on the main screen as Mode.")
             }
         }
         .formStyle(.grouped)

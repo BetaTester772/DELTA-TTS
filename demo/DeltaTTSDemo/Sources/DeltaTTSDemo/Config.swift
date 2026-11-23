@@ -61,6 +61,9 @@ struct DemoConfig: Codable, Equatable, Sendable {
         var venue = "NeurIPS 2026"
         var defaultTranscript = "To be, or not to be, that is the question"  // read aloud while recording
         var defaultText = "Hello, this is your voice."
+        /// Measured speedup of the fast mode, for the Mode tooltip when this Mac has no live
+        /// measurement yet (null: none).
+        var fastSpeedupPercent: Double?
     }
 
     /// Microphone recording of the prompt (the app only).
