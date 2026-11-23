@@ -129,18 +129,23 @@ On the 8 zero-shot prompts of the demo page (150 to 452 positions; measured with
 
 ## Demo app
 
-A macOS app (SwiftUI, Liquid Glass; macOS 26 or newer) in `demo/DeltaTTSDemo` talks to a small local server, `demo/server.py`, which keeps the model loaded.
-Both read `demo/config.json`: server settings, prompt presets (the prompts of the demo page), synthesis and processing defaults, and warning thresholds.
+A macOS app for a live demo (SwiftUI; macOS 26 or newer) in `demo/DeltaTTSDemo`: a visitor reads one sentence into the microphone, types what their voice should say, and hears it.
+It talks to a small local server, `demo/server.py`, which keeps the model loaded.
+Both read `demo/config.json`: server settings, the header titles, the sentence to read and the default text, recording settings, sample voices (the prompts of the demo page), synthesis and processing defaults, and warning thresholds.
 
 ```bash
 uv run python demo/server.py              # loads the model; GET /health reports "loading", then "ready"
 uv run python demo/server.py --dry-run    # no model: returns a tone of the estimated output length
-cd demo/DeltaTTSDemo && swift build && swift run
+demo/DeltaTTSDemo/make_app.sh             # builds demo/DeltaTTSDemo/build/DeltaTTSDemo.app
+open demo/DeltaTTSDemo/build/DeltaTTSDemo.app
 ```
 
-- The app can also start the server itself (Start Server; Settings > General sets the repository path, the uv path and dry-run mode).
-- Settings (Cmd-,) edit every section of the config. They are saved to `~/Library/Application Support/DeltaTTSDemo/config.json`, which the app passes to a server it starts; Reset to Defaults reloads `demo/config.json`.
-- `POST /synthesize` takes `text`, `prompt_text`, `prompt_wav_base64` (or `prompt_wav_path`) and optional synthesis and processing fields, and returns a base64 WAV with `duration_s`, `elapsed_s`, `rtf` and `warnings` (`{level, code, message}`): the library's logged warnings, the fast mode's float32 fallback, and checks of the text, transcript, prompt and estimated output length.
+- Use the app bundle: macOS grants microphone access only to apps whose Info.plist explains it. `make_app.sh` builds the release binary, writes that Info.plist and signs the bundle ad hoc; macOS asks for the microphone on the first recording (if access was denied, allow DeltaTTSDemo in System Settings > Privacy & Security > Microphone). A rebuilt bundle may be asked again. `swift run` in `demo/DeltaTTSDemo` also works, with sample voices only.
+- The main screen has four steps: read and record (a countdown, then the sentence shown large while recording, up to 12 s), type what to say, generate, listen. "Next visitor" (Command-N) deletes the recording, clears the app and asks the server to forget it (`POST /reset`).
+- Recording uses the system default microphone, or one chosen in step 1 or in Settings > Demo; playback always goes to the system default output, following headphones as they are connected. Leading and trailing silence of a recording is cut before upload.
+- Recordings are kept in a private temporary folder and deleted on Next visitor and when the app quits. The server keeps uploads only in its own temporary folder, removed by `/reset` and when it exits.
+- Settings (Command-,) edit every section of the config, start and stop the server, and show its log. They are saved to `~/Library/Application Support/DeltaTTSDemo/config.json` (or `$DELTA_TTS_DEMO_CONFIG`), which the app passes to a server it starts; Reset to Defaults reloads `demo/config.json`. `app.ui_scale` sets the size of the main screen.
+- `POST /synthesize` takes `text`, `prompt_text`, `prompt_wav_base64` (or `prompt_wav_path`) and optional synthesis and processing fields, and returns a base64 WAV with `duration_s`, `elapsed_s`, `rtf` and `warnings` (`{level, code, message}`): the library's logged warnings, the fast mode's float32 fallback, and checks of the text, transcript, prompt and estimated output length. `POST /reset` deletes the uploaded prompts and clears the cached prompt features (speaker embeddings).
 
 Security: the server is for local use by the app and must not be exposed to a network.
 It listens on 127.0.0.1 and accepts only loopback `Host` headers; it rejects requests with an `Origin` header (unless listed in `server.allowed_origins`), sends no CORS headers, and requires `Content-Type: application/json` on POST, so that web pages cannot use it.
