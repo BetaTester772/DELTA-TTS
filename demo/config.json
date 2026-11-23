@@ -1,0 +1,73 @@
+{
+  "server": {
+    "host": "127.0.0.1",
+    "port": 8765,
+    "backbone_dir": "pretrained_models/Fun-CosyVoice3-0.5B-2512",
+    "checkpoint": "pretrained_models/DELTA-TTS/delta_tts.pt",
+    "reuse_dir": "nvidia/NVIDIA-NemotronLabs-RE-USE",
+    "device": null,
+    "compute": "exact"
+  },
+  "presets": [
+    {
+      "name": "Nurse button",
+      "wav": "docs/audio/zeroshot/common_voice_en_17267923-common_voice_en_17267922_prompt.wav",
+      "transcript": "I pressed the button for my nurse, but he did not come."
+    },
+    {
+      "name": "Fig tree",
+      "wav": "docs/audio/zeroshot/common_voice_en_18229682-common_voice_en_18229679_prompt.wav",
+      "transcript": "The fruit of a fig tree is apple shaped."
+    },
+    {
+      "name": "Diverse school",
+      "wav": "docs/audio/zeroshot/common_voice_en_19748971-common_voice_en_19748974_prompt.wav",
+      "transcript": "The school is considered to be both economically and ethnically diverse."
+    },
+    {
+      "name": "Padre Island",
+      "wav": "docs/audio/zeroshot/common_voice_en_37232389-common_voice_en_37190783_prompt.wav",
+      "transcript": "The island's southern end connects by roadway to Padre Island."
+    },
+    {
+      "name": "Carrier planes",
+      "wav": "docs/audio/zeroshot/common_voice_en_22728555-common_voice_en_22728571_prompt.wav",
+      "transcript": "Many planes would be lost if they could not see their carriers."
+    },
+    {
+      "name": "Gum arabic",
+      "wav": "docs/audio/zeroshot/common_voice_en_19724030-common_voice_en_19724029_prompt.wav",
+      "transcript": "Gum arabic is used primarily in the food industry as a stabilizer."
+    },
+    {
+      "name": "Roche rim",
+      "wav": "docs/audio/zeroshot/common_voice_en_19845853-common_voice_en_19845856_prompt.wav",
+      "transcript": "The western rim of Roche has been somewhat distorted and straightened."
+    },
+    {
+      "name": "East terrace",
+      "wav": "docs/audio/zeroshot/common_voice_en_19619855-common_voice_en_19619858_prompt.wav",
+      "transcript": "The east terrace would also have a roof added as part of this development."
+    }
+  ],
+  "synthesis": {
+    "length_scale": 1.0,
+    "num_steps": 16,
+    "temperature": 0.0,
+    "top_p": 0.8,
+    "t_shift": 0.3,
+    "compute": "exact"
+  },
+  "processing": {
+    "enhance_prompt": false,
+    "trim_prompt": false,
+    "trim_output": false
+  },
+  "warnings": {
+    "min_prompt_seconds": 3,
+    "max_prompt_seconds": 30,
+    "min_prompt_sample_rate": 16000,
+    "max_text_chars": 400,
+    "max_output_seconds": 30
+  }
+}

@@ -7,3 +7,5 @@ outputs/
 third_party/checkpoints/
 *.wav
 !docs/**/*.wav
+demo/DeltaTTSDemo/.build/
+demo/DeltaTTSDemo/.swiftpm/
