@@ -54,12 +54,33 @@ struct DemoConfig: Codable, Equatable, Sendable {
         var maxOutputSeconds = 30.0
     }
 
+    /// What a visitor starts with (the app only; the server ignores this section).
+    struct Demo: Codable, Equatable, Sendable {
+        var title = "DELTA-TTS"
+        var subtitle = "Adapting Autoregressive Model into Diffusion Language Model for Text-to-Speech"
+        var venue = "NeurIPS 2026"
+        var defaultTranscript = "To be, or not to be, that is the question"  // read aloud while recording
+        var defaultText = "Hello, this is your voice."
+    }
+
+    /// Microphone recording of the prompt (the app only).
+    struct Recording: Codable, Equatable, Sendable {
+        var maxSeconds = 12.0  // recording stops by itself after this
+        var countdownSeconds = 3
+        var sampleRate = 24000.0  // mono 16-bit WAV
+        var trimSilence = true  // cut leading and trailing silence before upload
+        var inputDeviceUid = ""  // empty: the system default input
+        var inputDeviceName = ""  // name of that device, for messages when it is missing
+    }
+
     /// Settings of the app only; the server ignores this section.
     struct App: Codable, Equatable, Sendable {
         var serverUrl = ""  // empty: http://<server.host>:<server.port>
         var repoPath = ""  // DELTA-TTS checkout, for presets, defaults and starting the server
         var uvPath = ""  // empty: search the usual install locations
         var launchDryRun = false
+        var uiScale = 1.0  // text and control size on the main screen
+        var showSaveButton = false  // saved files are not deleted by Next visitor
     }
 
     var server = Server()
@@ -67,6 +88,8 @@ struct DemoConfig: Codable, Equatable, Sendable {
     var synthesis = Synthesis()
     var processing = Processing()
     var warnings = Thresholds()
+    var demo = Demo()
+    var recording = Recording()
     var app = App()
 }
 
@@ -164,8 +187,13 @@ enum ConfigError: LocalizedError {
 
 /// Where the config lives: the user's copy in Application Support and the repository defaults.
 enum ConfigStore {
+    /// ~/Library/Application Support/DeltaTTSDemo/config.json, or $DELTA_TTS_DEMO_CONFIG (e.g. one
+    /// profile per screen, or a test setup).
     static var userConfigURL: URL {
-        URL.applicationSupportDirectory.appending(path: "DeltaTTSDemo/config.json")
+        if let path = ProcessInfo.processInfo.environment["DELTA_TTS_DEMO_CONFIG"], !path.isEmpty {
+            return URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
+        }
+        return URL.applicationSupportDirectory.appending(path: "DeltaTTSDemo/config.json")
     }
 
     /// The user's config, or nil when there is none yet.

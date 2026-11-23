@@ -70,5 +70,24 @@
     "min_prompt_sample_rate": 16000,
     "max_text_chars": 400,
     "max_output_seconds": 30
+  },
+  "demo": {
+    "title": "DELTA-TTS",
+    "subtitle": "Adapting Autoregressive Model into Diffusion Language Model for Text-to-Speech",
+    "venue": "NeurIPS 2026",
+    "default_transcript": "To be, or not to be, that is the question",
+    "default_text": "Hello, this is your voice."
+  },
+  "recording": {
+    "max_seconds": 12,
+    "countdown_seconds": 3,
+    "sample_rate": 24000,
+    "trim_silence": true,
+    "input_device_uid": "",
+    "input_device_name": ""
+  },
+  "app": {
+    "ui_scale": 1.0,
+    "show_save_button": false
   }
 }
