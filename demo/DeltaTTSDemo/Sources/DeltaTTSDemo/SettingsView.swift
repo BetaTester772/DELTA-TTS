@@ -276,6 +276,10 @@ struct ServerSettings: View {
         @Bindable var model = model
         Form {
             Section {
+                Toggle(isOn: $model.config.server.prewarmFast) {
+                    Text("Warm up the fast mode at start")
+                    Text("Loads the Neural Engine in the background while Exact runs, so that Fast is ready when chosen.")
+                }
                 TextField("Host", text: $model.config.server.host)
                 TextField("Port", value: $model.config.server.port, format: .number.grouping(.never))
                 Picker("Device", selection: device) {

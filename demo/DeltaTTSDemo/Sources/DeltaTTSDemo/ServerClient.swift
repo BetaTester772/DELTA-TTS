@@ -32,11 +32,13 @@ struct Health: Decodable, Equatable, Sendable {
     var sampleRate: Int?
     var dryRun: Bool
     var busy: Bool?
-    var backend: BackendStatus?  // nil when the server or the pipeline does not report it
+    var backend: BackendStatus?  // the current mode's; nil when the server or the pipeline does not report it
+    var fastBackend: BackendStatus?  // the fast mode's, also while warming up in the background in exact mode
     var timing: [String: ModeTiming]?  // per compute mode, measured on this machine
 
     enum CodingKeys: String, CodingKey {
         case status, error, device, compute, busy, backend, timing
+        case fastBackend = "fast_backend"
         case sampleRate = "sample_rate"
         case dryRun = "dry_run"
     }
@@ -52,6 +54,7 @@ struct Health: Decodable, Equatable, Sendable {
         busy = try c.decodeIfPresent(Bool.self, forKey: .busy)
         // An optional display: a field the app does not understand must not break /health.
         backend = try? c.decodeIfPresent(BackendStatus.self, forKey: .backend)
+        fastBackend = try? c.decodeIfPresent(BackendStatus.self, forKey: .fastBackend)
         timing = try? c.decodeIfPresent([String: ModeTiming].self, forKey: .timing)
     }
 }
@@ -73,8 +76,8 @@ struct ModeTiming: Decodable, Equatable, Sendable {
 /// The generation backend's readiness (`DeltaTTSPipeline.backend_status()`), e.g. the fast
 /// mode's Neural Engine functions compiling in the background. Every field is optional.
 struct BackendStatus: Decodable, Equatable, Sendable {
-    var backend: String?  // "neural_engine", "float16" or "float32"
-    var state: String?  // "loading", "compiling", "ready" or "failed"
+    var backend: String?  // "neural_engine", "float16" or "float32"; nil before the fast backend is built
+    var state: String?  // "not_started", "idle", "loading", "compiling", "ready" or "failed"
     var readyBuckets: Int?
     var totalBuckets: Int?
     var maxReadyLen: Int?

@@ -449,12 +449,18 @@ final class AppModel {
     @ObservationIgnored private var computeEndpointMissing = false  // an older server without POST /compute
     private(set) var fastBackendJustReady = false  // shows "Ready" for a few seconds
 
+    /// The fast backend's state: `fast_backend` (reported in either mode, as it warms up in the
+    /// background from the server's start), else, from an older server, `backend` in fast mode.
+    private func fastBackendStatus(of health: Health?) -> BackendStatus? {
+        if let fast = health?.fastBackend { return fast }
+        return health?.compute == ComputeMode.fast.rawValue ? health?.backend : nil
+    }
+
     var fastBackendDisplay: FastBackendDisplay {
-        guard config.synthesis.compute == .fast, serverState == .ready, let health, let backend = health.backend else {
-            return .hidden
-        }
-        guard health.compute == ComputeMode.fast.rawValue else { return .warming(ready: nil, total: nil) }  // switching
+        guard serverState == .ready, let health, let backend = fastBackendStatus(of: health) else { return .hidden }
         switch backend.state ?? "" {
+        case "not_started":  // built by the switch to fast, which the app has asked for
+            return config.synthesis.compute == .fast ? .warming(ready: nil, total: nil) : .hidden
         case "idle", "loading", "compiling":
             return .warming(ready: backend.readyBuckets, total: backend.totalBuckets)
         case "failed":
@@ -472,7 +478,7 @@ final class AppModel {
     /// Measured on this Mac once both modes have 3 clean generations, else the configured value
     /// (`demo.fast_speedup_percent`, from a controlled measurement), else no number.
     var fastModeHelp: String {
-        let onGPU = health?.backend?.backend == "float16"
+        let onGPU = (fastBackendStatus(of: health)?.backend ?? health?.backend?.backend) == "float16"
         var text = "Fast runs DELTA-TTS " + (onGPU ? "on the GPU" : "on the Neural Engine") + " in reduced precision. "
         if let percent = liveFastSpeedupPercent {
             text += percent >= 5 ? "On this Mac: about \(percent)% faster generation." : "Speed depends on this Mac."
@@ -498,21 +504,31 @@ final class AppModel {
         Int((percent / 5).rounded()) * 5
     }
 
-    /// The fast mode is selected and its backend is still warming up (shown to visitors).
-    var fastBackendWarming: Bool {
+    /// The fast backend is still warming up (in either mode).
+    var fastBackendLoading: Bool {
         if case .warming = fastBackendDisplay { return true }
         return false
     }
 
+    /// The fast mode is selected and its backend is still warming up (shown to visitors).
+    var fastBackendWarming: Bool {
+        config.synthesis.compute == .fast && fastBackendLoading
+    }
+
     /// For staff, in Settings: "neural_engine, compiling 3/6, ready up to 300 tokens".
     var backendSummary: String? {
-        guard let backend = health?.backend else { return nil }
-        var parts = [backend.backend, backend.state].compactMap { $0 }
-        if let ready = backend.readyBuckets, let total = backend.totalBuckets, total > 0 { parts.append("\(ready)/\(total)") }
-        if let length = backend.maxReadyLen { parts.append("ready up to \(length) tokens") }
-        if let failed = backend.failedBuckets, failed > 0 { parts.append("\(failed) failed") }
-        if let error = backend.error { parts.append(error) }
-        return parts.joined(separator: ", ")
+        func describe(_ backend: BackendStatus) -> String {
+            var parts = [backend.backend, backend.state].compactMap { $0 }
+            if let ready = backend.readyBuckets, let total = backend.totalBuckets, total > 0 { parts.append("\(ready)/\(total)") }
+            if let length = backend.maxReadyLen { parts.append("ready up to \(length) tokens") }
+            if let failed = backend.failedBuckets, failed > 0 { parts.append("\(failed) failed") }
+            if let error = backend.error { parts.append(error) }
+            return parts.joined(separator: ", ")
+        }
+        var lines: [String] = []
+        if let backend = health?.backend { lines.append("Now: " + describe(backend)) }
+        if let fast = health?.fastBackend { lines.append("Fast: " + describe(fast)) }
+        return lines.isEmpty ? nil : lines.joined(separator: "\n")
     }
 
     /// Ask the server to use the selected compute mode now, so that the fast backend warms up
@@ -534,10 +550,11 @@ final class AppModel {
 
     /// Take a /health result; note the fast backend becoming ready, to show "Ready" briefly.
     private func applyHealth(_ new: Health) {
-        let wasWarming = health?.backend.map { ["idle", "loading", "compiling"].contains($0.state ?? "") } ?? false
+        let warming: Set<String> = ["idle", "loading", "compiling"]
+        let wasWarming = warming.contains(fastBackendStatus(of: health)?.state ?? "")
         health = new
         healthError = nil
-        if wasWarming, new.backend?.state == "ready", new.compute == ComputeMode.fast.rawValue {
+        if wasWarming, fastBackendStatus(of: new)?.state == "ready" {
             fastBackendJustReady = true
             Task {
                 try? await Task.sleep(for: .seconds(4))
@@ -571,7 +588,7 @@ final class AppModel {
     func pollHealth() async {
         while !Task.isCancelled {
             await refreshHealth()
-            try? await Task.sleep(for: .seconds(serverState == .ready && !fastBackendWarming ? 5 : 1))
+            try? await Task.sleep(for: .seconds(serverState == .ready && !fastBackendLoading ? 5 : 1))
         }
     }
 

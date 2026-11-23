@@ -209,6 +209,8 @@ struct FastBackendStatus: View {
     @Environment(\.uiScale) private var scale
 
     var body: some View {
+        // In exact mode it is the fast backend warming up in the background: say so.
+        let fast = model.config.synthesis.compute == .fast
         switch model.fastBackendDisplay {
         case .hidden:
             EmptyView()
@@ -216,19 +218,19 @@ struct FastBackendStatus: View {
             HStack(spacing: 5 * scale) {
                 ProgressView().controlSize(.mini)
                 if let ready, let total, total > 0 {
-                    Text("Warming up \(ready)/\(total)").monospacedDigit()
+                    Text((fast ? "Warming up" : "Fast: warming up") + " \(ready)/\(total)").monospacedDigit()
                 } else {
-                    Text("Warming up")
+                    Text(fast ? "Warming up" : "Fast: warming up")
                 }
             }
             .foregroundStyle(Theme.secondaryText)
             .help(model.fastModeHelp)
         case .ready:
-            Text("Ready")
+            Text(fast ? "Ready" : "Fast ready")
                 .foregroundStyle(Theme.accent)
                 .transition(.opacity)
         case .unavailable(let reason):
-            Text("Unavailable")
+            Text(fast ? "Unavailable" : "Fast unavailable")
                 .foregroundStyle(Theme.error)
                 .help(reason)
         }
@@ -769,31 +771,31 @@ struct ActionBar: View {
         }
     }
 
-    /// Right of the primary button: regenerate the voice, listen to the recording, edit the text.
+    /// Right of the primary button: listen to the recording, regenerate the voice, edit the text.
     @ViewBuilder private var trailing: some View {
         if canChangeRecording, model.promptURL != nil {
+            // The recording (as the model hears it), also after generation, to compare with the voice
+            switch model.prepareState {
+            case .preparing:
+                SecondaryButton(title: "Preparing...", systemImage: "play.fill", help: "Your voice is being prepared",
+                                busy: true) {}
+                    .disabled(true)
+            case .ready where model.canPlayPrompt:
+                let playing = model.promptPlayer.isPlaying
+                SecondaryButton(title: playing ? "Stop" : (model.selection == .recording ? "Play my recording" : "Play sample"),
+                                systemImage: playing ? "stop.fill" : "play.fill",
+                                help: "Listen to your voice as the model hears it (cleaned and trimmed)",
+                                action: model.togglePromptPlayback)
+            default:
+                EmptyView()  // nothing processed to play (a failure is shown in step 1)
+            }
             if model.canRegenerate {
                 SecondaryButton(title: "Regenerate", systemImage: "arrow.clockwise",
                                 help: "Generate your voice again from the same recording and text (\u{2318}G)",
                                 action: model.regenerate)
             }
-            if !model.outputIsCurrent {
-                switch model.prepareState {
-                case .preparing:
-                    SecondaryButton(title: "Preparing...", systemImage: "play.fill", help: "Your voice is being prepared",
-                                    busy: true) {}
-                        .disabled(true)
-                case .ready where model.canPlayPrompt:
-                    let playing = model.promptPlayer.isPlaying
-                    SecondaryButton(title: playing ? "Stop" : (model.selection == .recording ? "Play my recording" : "Play sample"),
-                                    systemImage: playing ? "stop.fill" : "play.fill",
-                                    help: "Listen to your voice as the model hears it (cleaned and trimmed)",
-                                    action: model.togglePromptPlayback)
-                default:
-                    EmptyView()  // nothing processed to play (a failure is shown in step 1)
-                }
-            }
-            if !textFocused.wrappedValue {
+            // Before the first generation; afterwards the text field in step 2 is the way to edit
+            if !model.outputIsCurrent, !textFocused.wrappedValue {
                 SecondaryButton(title: "Edit text", systemImage: "pencil", help: "Change what your voice says") {
                     textFocused.wrappedValue = true
                 }

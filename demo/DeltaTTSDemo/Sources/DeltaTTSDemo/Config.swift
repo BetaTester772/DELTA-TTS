@@ -20,6 +20,7 @@ struct DemoConfig: Codable, Equatable, Sendable {
         var device: String?
         var compute = ComputeMode.exact
         var allowedOrigins: [String] = []
+        var prewarmFast = true  // load the fast backend in the background from the start
     }
 
     struct Preset: Codable, Equatable, Identifiable, Sendable {
