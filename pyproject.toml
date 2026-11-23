@@ -50,9 +50,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Apple Silicon (MPS): `uv sync --extra mac`. CosyVoice runs its ONNX models on the CPU build.
+# Apple Silicon (MPS): `uv sync --extra mac`. CosyVoice runs its ONNX models on the CPU build;
+# coremltools exports and runs DELTA-TTS on the Neural Engine (delta_tts/coreml.py).
 mac = [
     "onnxruntime==1.24.4; sys_platform == 'darwin'",
+    "coremltools==9.0; sys_platform == 'darwin'",
 ]
 # Audio processing around DELTA-TTS (delta_tts/audio.py): Silero VAD and NVIDIA RE-USE speech enhancement.
 # RE-USE runs on a pure-PyTorch Mamba port, so mamba-ssm is not needed.
