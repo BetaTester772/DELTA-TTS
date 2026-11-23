@@ -6,7 +6,8 @@
     "checkpoint": "pretrained_models/DELTA-TTS/delta_tts.pt",
     "reuse_dir": "nvidia/NVIDIA-NemotronLabs-RE-USE",
     "device": null,
-    "compute": "exact"
+    "compute": "exact",
+    "allowed_origins": []
   },
   "presets": [
     {

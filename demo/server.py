@@ -14,6 +14,12 @@ that cannot be served gets an HTTP 4xx/5xx status and {error, code, warnings}.
 
 --dry-run imports no model: /synthesize returns a tone as long as the estimated output, after
 the same checks, so that the app can be developed without the checkpoints or a GPU.
+
+Security: the server is for local use by the demo app and must not be exposed to a network.
+It binds to 127.0.0.1, accepts only Host headers of the loopback addresses (DNS rebinding),
+rejects requests with an Origin header and non-JSON POSTs (cross-site requests from a browser),
+reads prompt paths only inside the repository, the preset directories and its upload directory,
+and bounds request bodies and the uploaded prompts it keeps.
 """
 
 from __future__ import annotations
@@ -29,6 +35,7 @@ import io
 import json
 import logging
 import math
+import os
 import shutil
 import signal
 import sys
@@ -36,6 +43,7 @@ import tempfile
 import threading
 import time
 import wave
+from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass
 from http import HTTPStatus
@@ -52,7 +60,16 @@ MAX_PROMPT_SECONDS = 30  # the CosyVoice 3 speech tokenizer rejects longer promp
 MIN_PROMPT_SAMPLE_RATE = 16000  # CosyVoice 3 does not upsample prompts from below 16 kHz
 COMPUTE_MODES = ("exact", "fast")
 PROCESSING_KEYS = ("enhance_prompt", "trim_prompt", "trim_output")
-MAX_BODY_BYTES = 64 * 1024 * 1024
+LOCAL_HOSTS = ("127.0.0.1", "localhost", "::1")
+
+# Limits on what a request can make the server read and keep
+MAX_BODY_BYTES = 25 * 2**20
+MAX_UPLOAD_BYTES = 18 * 2**20  # decoded prompt audio
+MAX_UPLOAD_SECONDS = 60
+MIN_UPLOAD_SAMPLE_RATE = 8000
+MAX_UPLOAD_FILES = 32  # uploaded prompts kept, least recently used dropped first
+MAX_UPLOAD_DIR_BYTES = 200 * 2**20
+AUDIO_ERRORS = (OSError, RuntimeError, EOFError, ValueError, ArithmeticError, wave.Error)  # soundfile raises RuntimeErrors
 
 DRY_RUN_SAMPLE_RATE = 24000
 DRY_RUN_LOAD_SECONDS = 1.0  # simulated model loading, so that clients see the "loading" state
@@ -147,6 +164,66 @@ def audio_info(path: Path) -> tuple[float, int]:
     return info.frames / info.samplerate, int(info.samplerate)
 
 
+class UploadStore:
+    """Uploaded prompts in a private temporary directory, removed by `close`.
+
+    Each file is named by its content hash, so that a repeated upload maps to the same path and
+    hits the pipeline's prompt cache (keyed by path, mtime and size). The store keeps at most
+    `max_files` files and `max_bytes` bytes and drops the least recently used first. Recency is
+    tracked in memory rather than by touching mtimes, which would invalidate the prompt cache.
+    """
+
+    def __init__(self, max_files: int = MAX_UPLOAD_FILES, max_bytes: int = MAX_UPLOAD_DIR_BYTES) -> None:
+        self.dir = Path(tempfile.mkdtemp(prefix="delta_tts_demo_uploads_")).resolve()  # mode 0700
+        self.max_files = max_files
+        self.max_bytes = max_bytes
+        self._files: OrderedDict[Path, int] = OrderedDict()  # path -> size, least recently used first
+
+    def add(self, audio: bytes, suffix: str) -> Path:
+        """Store `audio` after checking that it is audio of a sane length and sample rate.
+
+        Raises:
+            RequestError: The audio is unreadable, too long or sampled too low.
+        """
+        target = self.dir / f"{hashlib.sha256(audio).hexdigest()[:32]}{suffix}"
+        if target in self._files and target.is_file():
+            self._files.move_to_end(target)
+            return target
+        fd, incoming = tempfile.mkstemp(dir=self.dir, prefix=".incoming_", suffix=suffix)
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(audio)
+            self._validate(Path(incoming))
+            os.replace(incoming, target)
+        finally:
+            Path(incoming).unlink(missing_ok=True)
+        self._files[target] = len(audio)
+        self._files.move_to_end(target)
+        self._evict()
+        return target
+
+    def close(self) -> None:
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    @staticmethod
+    def _validate(path: Path) -> None:
+        try:
+            seconds, sample_rate = audio_info(path)
+        except AUDIO_ERRORS as e:
+            logger.info("Rejected an uploaded prompt: %s: %s", type(e).__name__, e)
+            raise bad_request("prompt_unreadable", "The uploaded prompt is not readable audio; use a WAV or FLAC file.") from None
+        if seconds > MAX_UPLOAD_SECONDS:
+            raise bad_request("prompt_long", f"The uploaded prompt is {seconds:.1f} s long; at most {MAX_UPLOAD_SECONDS} s are accepted.")
+        if sample_rate < MIN_UPLOAD_SAMPLE_RATE:
+            raise bad_request("prompt_low_sample_rate",
+                              f"The uploaded prompt is sampled at {sample_rate} Hz; at least {MIN_UPLOAD_SAMPLE_RATE} Hz are accepted.")
+
+    def _evict(self) -> None:
+        while len(self._files) > 1 and (len(self._files) > self.max_files or sum(self._files.values()) > self.max_bytes):
+            path, _ = self._files.popitem(last=False)
+            path.unlink(missing_ok=True)
+
+
 def estimate_output_seconds(text: str, prompt_text: str, prompt_seconds: float | None, length_scale: float) -> float:
     """Output duration by the length rule of delta_tts/duration.py, as the pipeline applies it.
 
@@ -202,7 +279,8 @@ class SynthesisRequest:
     thresholds: dict[str, float]
 
 
-def parse_request(body: dict[str, Any], config: dict[str, Any], upload_dir: Path) -> SynthesisRequest:
+def parse_request(body: dict[str, Any], config: dict[str, Any], uploads: UploadStore,
+                  prompt_roots: list[Path]) -> SynthesisRequest:
     """Validate the request body and fill in the defaults of the config."""
     synthesis, processing = config["synthesis"], config["processing"]
     overrides = body.get("warnings") or {}
@@ -244,7 +322,7 @@ def parse_request(body: dict[str, Any], config: dict[str, Any], upload_dir: Path
     return SynthesisRequest(
         text=string("text"),
         prompt_text=string("prompt_text"),
-        prompt_wav=resolve_prompt(body, upload_dir),
+        prompt_wav=resolve_prompt(body, uploads, prompt_roots),
         length_scale=number("length_scale", get("length_scale", synthesis), lambda v: 0 < v <= 10, "in (0, 10]"),
         decoding={
             "num_steps": int(num_steps),
@@ -258,30 +336,35 @@ def parse_request(body: dict[str, Any], config: dict[str, Any], upload_dir: Path
     )
 
 
-def resolve_prompt(body: dict[str, Any], upload_dir: Path) -> Path:
-    """The prompt audio file: an uploaded one (`prompt_wav_base64`, stored under its content
-    hash, so that the pipeline's prompt cache recognizes a repeated upload) or a path."""
+def resolve_prompt(body: dict[str, Any], uploads: UploadStore, prompt_roots: list[Path]) -> Path:
+    """The prompt audio file: an upload (`prompt_wav_base64`) or a path (`prompt_wav_path`) that
+    resolves, symlinks included, inside one of `prompt_roots`. Responses never name the
+    resolved path; the details are logged."""
     data, path = body.get("prompt_wav_base64"), body.get("prompt_wav_path")
     if data:
         if not isinstance(data, str):
             raise bad_request("invalid_parameter", "prompt_wav_base64 must be a string")
+        if len(data) > (MAX_UPLOAD_BYTES + 2) // 3 * 4:
+            raise RequestError(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "too_large",
+                               f"The prompt audio is larger than {MAX_UPLOAD_BYTES // 2**20} MB.")
         try:
             audio = base64.b64decode(data, validate=True)
         except (binascii.Error, ValueError):
-            raise bad_request("prompt_unreadable", "prompt_wav_base64 is not valid base64") from None
+            raise bad_request("prompt_unreadable", "prompt_wav_base64 is not valid base64.") from None
         suffix = Path(str(body.get("prompt_wav_name") or "prompt.wav")).suffix.lower()
         if not (2 <= len(suffix) <= 6 and suffix[1:].isalnum()):
             suffix = ".wav"
-        target = upload_dir / f"{hashlib.sha256(audio).hexdigest()[:32]}{suffix}"
-        if not target.exists():
-            target.write_bytes(audio)
-        return target
+        return uploads.add(audio, suffix)
     if path:
         if not isinstance(path, str):
             raise bad_request("invalid_parameter", "prompt_wav_path must be a string")
-        resolved = resolve(path)
+        resolved = resolve(path).resolve()
+        if not any(resolved.is_relative_to(root) for root in prompt_roots):
+            logger.warning("Rejected prompt_wav_path %r: %s is outside %s", path, resolved, [str(r) for r in prompt_roots])
+            raise RequestError(HTTPStatus.FORBIDDEN, "prompt_not_allowed", "Prompt audio not allowed.")
         if not resolved.is_file():
-            raise bad_request("prompt_not_found", f"Prompt audio not found: {resolved}")
+            logger.warning("prompt_wav_path %r: %s is not a file", path, resolved)
+            raise bad_request("prompt_not_found", "Prompt audio not found.")
         return resolved
     raise bad_request("prompt_missing", "No prompt audio: give prompt_wav_path or prompt_wav_base64.")
 
@@ -315,9 +398,9 @@ def check_request(request: SynthesisRequest, notices: list[Notice]) -> float:
 
     try:
         prompt_seconds, sample_rate = audio_info(request.prompt_wav)
-    except (OSError, RuntimeError, EOFError, ValueError, wave.Error) as e:  # soundfile raises RuntimeErrors
-        raise bad_request("prompt_unreadable",
-                          f"Cannot read the prompt audio ({type(e).__name__}: {e}). Use a WAV or FLAC file.") from None
+    except AUDIO_ERRORS as e:
+        logger.info("Cannot read the prompt %s: %s: %s", request.prompt_wav, type(e).__name__, e)
+        raise bad_request("prompt_unreadable", "Cannot read the prompt audio; use a WAV or FLAC file.") from None
     if sample_rate < MIN_PROMPT_SAMPLE_RATE:
         raise bad_request("prompt_low_sample_rate",
                           f"The prompt is sampled at {sample_rate} Hz; CosyVoice 3 needs at least {MIN_PROMPT_SAMPLE_RATE} Hz.")
@@ -371,13 +454,16 @@ class TTSService:
         self._fast_forward: Any = None  # ReducedPrecisionForward, created on first use
         self._processors: dict[tuple[bool, bool, bool], Any] = {}  # AudioProcessor per setting
         self._lock = threading.Lock()  # one synthesis at a time
-        self.upload_dir = Path(tempfile.mkdtemp(prefix="delta_tts_demo_"))
+        self.uploads = UploadStore()
+        # Directories that prompt_wav_path may point into
+        preset_dirs = {resolve(preset["wav"]).resolve().parent for preset in config["presets"]}
+        self.prompt_roots = [REPO_ROOT, self.uploads.dir, *sorted(preset_dirs - {REPO_ROOT})]
 
     def start_loading(self) -> None:
         threading.Thread(target=self._load, name="model-loader", daemon=True).start()
 
     def close(self) -> None:
-        shutil.rmtree(self.upload_dir, ignore_errors=True)
+        self.uploads.close()
 
     def _load(self) -> None:
         try:
@@ -437,7 +523,7 @@ class TTSService:
         if self.status == "error":
             raise RequestError(HTTPStatus.SERVICE_UNAVAILABLE, "server_failed", f"The model failed to load: {self.error}")
         with self._lock:
-            request = parse_request(body, self.config, self.upload_dir)
+            request = parse_request(body, self.config, self.uploads, self.prompt_roots)
             estimate = check_request(request, notices)
             if self.dry_run:
                 pcm, elapsed, fell_back = self._synthesize_dry_run(request, estimate, notices)
@@ -541,24 +627,38 @@ class TTSService:
 class Handler(BaseHTTPRequestHandler):
     """JSON endpoints over `TTSService`."""
 
-    service: TTSService  # set by `main`
+    # set by `main`
+    service: TTSService
+    allowed_hosts: frozenset[str] = frozenset()  # Host headers: the loopback addresses with the port
+    allowed_origins: frozenset[str] = frozenset()  # Origin headers: none by default (the app sends none)
     server_version = "DeltaTTSDemo/1.0"
 
     def do_GET(self) -> None:
         path = self.path.split("?", 1)[0]
-        if path == "/health":
-            self._send(HTTPStatus.OK, self.service.health())
-        elif path == "/config":
-            self._send(HTTPStatus.OK, self.service.public_config())
+        try:
+            self._check_client()
+            if path == "/health":
+                payload = self.service.health()
+            elif path == "/config":
+                payload = self.service.public_config()
+            else:
+                raise RequestError(HTTPStatus.NOT_FOUND, "not_found", "No such endpoint")
+        except RequestError as e:
+            self._send_error(e, [])
         else:
-            self._send_error(RequestError(HTTPStatus.NOT_FOUND, "not_found", f"No endpoint {path}"), [])
+            self._send(HTTPStatus.OK, payload)
+
+    def do_OPTIONS(self) -> None:
+        # No CORS: a browser's preflight for a cross-origin JSON POST fails here.
+        self._send_error(RequestError(HTTPStatus.METHOD_NOT_ALLOWED, "method_not_allowed", "OPTIONS is not supported"), [])
 
     def do_POST(self) -> None:
         path = self.path.split("?", 1)[0]
         notices: list[Notice] = []
         try:
+            self._check_client()
             if path != "/synthesize":
-                raise RequestError(HTTPStatus.NOT_FOUND, "not_found", f"No endpoint {path}")
+                raise RequestError(HTTPStatus.NOT_FOUND, "not_found", "No such endpoint")
             result = self.service.synthesize(self._read_json(), notices)
         except RequestError as e:
             self._send_error(e, notices)
@@ -570,12 +670,30 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._send(HTTPStatus.OK, result)
 
+    def _check_client(self) -> None:
+        """Reject requests that a web page could send: another Host (DNS rebinding) or an Origin
+        outside the allowlist (cross-site requests)."""
+        host = (self.headers.get("Host") or "").lower()
+        if host not in self.allowed_hosts:
+            logger.warning("Rejected a request with Host %r", host)
+            raise RequestError(HTTPStatus.FORBIDDEN, "forbidden", "Host not allowed")
+        origin = self.headers.get("Origin")
+        if origin is not None and origin not in self.allowed_origins:
+            logger.warning("Rejected a request with Origin %r", origin)
+            raise RequestError(HTTPStatus.FORBIDDEN, "forbidden", "Cross-origin requests are not allowed")
+
     def _read_json(self) -> dict[str, Any]:
+        content_type = (self.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+        if content_type != "application/json":
+            raise RequestError(HTTPStatus.UNSUPPORTED_MEDIA_TYPE, "unsupported_media_type",
+                               "Content-Type must be application/json")
+        if self.headers.get("Content-Length") is None:
+            raise RequestError(HTTPStatus.LENGTH_REQUIRED, "length_required", "Content-Length is required")
         try:
-            length = int(self.headers.get("Content-Length", "0"))
+            length = int(self.headers["Content-Length"])
         except ValueError:
             raise bad_request("bad_request", "Invalid Content-Length") from None
-        if length > MAX_BODY_BYTES:
+        if not 0 <= length <= MAX_BODY_BYTES:
             raise RequestError(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "too_large",
                                f"The request is larger than {MAX_BODY_BYTES // 2**20} MB")
         try:
@@ -621,8 +739,12 @@ def main() -> None:
 
     config = load_config(Path(args.config))
     host, port = args.host or config["server"]["host"], args.port or config["server"]["port"]
+    if host not in LOCAL_HOSTS:
+        logger.warning("Listening on %s: this server is for local use only and must not be exposed to a network", host)
     service = TTSService(config, dry_run=args.dry_run)
     Handler.service = service
+    Handler.allowed_hosts = frozenset({f"127.0.0.1:{port}", f"localhost:{port}", f"[::1]:{port}"})
+    Handler.allowed_origins = frozenset(config["server"].get("allowed_origins") or [])
     try:
         httpd = ThreadingHTTPServer((host, port), Handler)
     except OSError as e:
