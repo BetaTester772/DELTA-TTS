@@ -318,6 +318,8 @@ class CoreMLForward(FallbackForward):
     An utterance runs in float32 (the PyTorch model) when its sequence is longer than the largest
     bucket or when its bucket is not loaded yet; it then moves to the front of the loading queue.
     Non-finite logits fall back to float32 for the rest of the utterance (`FallbackForward`).
+    The Neural Engine saturates on float16 overflow instead of returning inf/NaN (an inf or NaN
+    input gives finite logits), so this check cannot catch a saturated activation.
     Call `reset` before every utterance.
 
     Args:
