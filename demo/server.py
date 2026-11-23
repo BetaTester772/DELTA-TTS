@@ -724,7 +724,16 @@ class Handler(BaseHTTPRequestHandler):
         logger.log(level, "%s %s", self.address_string(), format % args)
 
 
+def _ignore_stop_signals() -> None:
+    """Ignore further SIGTERM/SIGINT, so that a second signal cannot interrupt the cleanup:
+    `uv run` forwards the signals it receives, and the app sends SIGINT and then SIGTERM to the
+    process group, so the server often gets more than one."""
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+
 def _exit_on_sigterm(signum: int, frame: FrameType | None) -> None:
+    _ignore_stop_signals()
     raise SystemExit(0)  # runs the cleanup in `main`
 
 
@@ -758,6 +767,7 @@ def main() -> None:
     except KeyboardInterrupt:
         pass
     finally:
+        _ignore_stop_signals()
         httpd.server_close()
         service.close()
 
