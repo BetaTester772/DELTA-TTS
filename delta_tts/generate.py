@@ -29,7 +29,7 @@ MAX_REPEAT = 3
 
 
 class LogitsModel(Protocol):
-    """What `generate` needs: `DeltaTTS`, or `ReducedPrecisionForward` for the fast mode."""
+    """What `generate` needs: `DeltaTTS`, or a `FallbackForward` (delta_tts/precision.py) for the fast mode."""
 
     def logits(self, text_token: torch.Tensor, speech_token: torch.Tensor) -> torch.Tensor: ...
 

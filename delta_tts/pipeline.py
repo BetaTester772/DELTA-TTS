@@ -30,7 +30,7 @@ import torchaudio
 from delta_tts.duration import estimate_speech_len
 from delta_tts.generate import generate
 from delta_tts.model import DeltaTTS
-from delta_tts.precision import ReducedPrecisionForward
+from delta_tts.precision import FallbackForward, ReducedPrecisionForward
 
 COSYVOICE_DIR = Path(__file__).resolve().parent.parent / "third_party" / "CosyVoice"
 sys.path.insert(0, str(COSYVOICE_DIR))
@@ -147,7 +147,7 @@ class DeltaTTSPipeline:
         # -----------------------------
         # 3. DELTA-TTS: speech tokens by iterative unmasking
         # -----------------------------
-        if isinstance(self.forward, ReducedPrecisionForward):
+        if isinstance(self.forward, FallbackForward):
             self.forward.reset()
         speech_token = generate(self.forward, text_token, prompt_speech_token, speech_len,
                                 progress=(lambda step, total: report("tokens", step, total)) if progress else None,
