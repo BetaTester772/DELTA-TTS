@@ -40,7 +40,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--temperature", type=float, default=0.0, help="0 takes the most likely token; above 0 samples")
     parser.add_argument("--device", default=None, help="cuda, mps or cpu; by default CUDA, then MPS, then CPU")
     parser.add_argument("--compute", choices=["exact", "fast"], default="exact",
-                        help="exact: float32; fast: reduced precision with a float32 fallback on overflow")
+                        help="exact: float32; fast: reduced precision with a float32 fallback on overflow "
+                             "(on MPS: the Neural Engine, if the Core ML model is exported)")
+    parser.add_argument("--coreml_model", help="Core ML model for --compute fast on MPS "
+                                               "(default: delta_tts_ane.mlmodelc next to the checkpoint)")
     # audio processing (`audio` extra): RE-USE speech enhancement and Silero VAD
     parser.add_argument("--enhance_prompt", action="store_true", help="enhance the prompt with RE-USE")
     parser.add_argument("--trim_prompt", action="store_true", help="trim leading/trailing non-speech of the prompt with Silero VAD")
@@ -63,7 +66,8 @@ def main() -> None:
 
         audio_processor = AudioProcessor(enhance_prompt=args.enhance_prompt, trim_prompt=args.trim_prompt,
                                          trim_output=args.trim_output, reuse_dir=args.reuse_dir, device=device)
-    tts = DeltaTTSPipeline(args.backbone_dir, args.checkpoint, device, audio_processor, compute=args.compute)
+    tts = DeltaTTSPipeline(args.backbone_dir, args.checkpoint, device, audio_processor, compute=args.compute,
+                           coreml_model=args.coreml_model)
     decoding = {"num_steps": args.num_steps, "temperature": args.temperature}
 
     # -----------------------------

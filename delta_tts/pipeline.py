@@ -73,21 +73,25 @@ class DeltaTTSPipeline:
         device: Torch device for DELTA-TTS and the CosyVoice 3 decoder. `default_device()` when None.
         audio_processor: Optional `delta_tts.audio.AudioProcessor` (Silero VAD, RE-USE) applied
             to the prompt before and to the output after synthesis.
-        compute: "exact" runs DELTA-TTS in float32. "fast" runs it in `fast_dtype` with a
-            float32 fallback on overflow (delta_tts/precision.py); its outputs differ numerically.
-        fast_dtype: Reduced precision of the fast mode.
+        compute: "exact" runs DELTA-TTS in float32. "fast" runs it approximately, with a float32
+            fallback on overflow; its outputs differ numerically. On MPS, with an exported Core ML
+            model and coremltools, it runs on the Neural Engine (delta_tts/coreml.py); otherwise
+            in `fast_dtype` with PyTorch (delta_tts/precision.py).
+        fast_dtype: Reduced precision of the PyTorch fast mode.
+        coreml_model: Compiled Core ML model for the fast mode on MPS. By default the one that
+            `python -m delta_tts.coreml export` writes next to `checkpoint`, if it exists.
     """
 
     def __init__(self, backbone_dir: str, checkpoint: str, device: str | None = None,
                  audio_processor: "AudioProcessor | None" = None, compute: str = "exact",
-                 fast_dtype: torch.dtype = torch.float16) -> None:
+                 fast_dtype: torch.dtype = torch.float16, coreml_model: str | None = None) -> None:
         if compute not in ("exact", "fast"):
             raise ValueError(f"compute must be 'exact' or 'fast', got {compute!r}")
         self.device = torch.device(device or default_device())
         self.model = DeltaTTS(backbone_dir).to(self.device).float().eval()
         self.model.load_checkpoint(checkpoint)
         self.model.merge_lora()
-        self.forward = ReducedPrecisionForward(self.model, fast_dtype) if compute == "fast" else self.model
+        self.forward = self.model if compute == "exact" else self._fast_forward(checkpoint, coreml_model, fast_dtype)
         with warnings.catch_warnings():
             # The CosyVoice config imports pyworld, which imports pkg_resources; setuptools 80
             # (used on macOS) warns about that import.
@@ -179,6 +183,23 @@ class DeltaTTSPipeline:
     def clear_prompt_cache(self) -> None:
         """Forget all cached prompts (features, speaker embeddings and processed audio)."""
         self._prompt_cache.clear()
+
+    def _fast_forward(self, checkpoint: str, coreml_model: str | None, fast_dtype: torch.dtype) -> FallbackForward:
+        """The fast mode: the Neural Engine on MPS when an exported Core ML model and coremltools
+        are available, otherwise reduced precision in PyTorch."""
+        if self.device.type == "mps":
+            from delta_tts import coreml
+
+            path = coreml_model or coreml.default_path(checkpoint)
+            if coreml_model is not None and not os.path.isdir(coreml_model):
+                raise FileNotFoundError(f"Core ML model not found: {coreml_model}")
+            if os.path.isdir(path) and coreml.is_available():
+                logger.info("Fast mode: DELTA-TTS on the Neural Engine (Core ML float16, %s)", path)
+                return coreml.CoreMLForward(self.model, path)
+            logger.info("Fast mode: no Neural Engine (%s)", "coremltools is not installed" if os.path.isdir(path)
+                        else f"no Core ML model at {path}; see `python -m delta_tts.coreml export`")
+        logger.info("Fast mode: DELTA-TTS in %s on %s", str(fast_dtype).removeprefix("torch."), self.device)
+        return ReducedPrecisionForward(self.model, fast_dtype)
 
     def _prompt(self, prompt_wav: str, prompt_text: str, report: Progress | None = None) -> dict:
         """Prompt features, from the cache when the same prompt file and transcript were seen.
