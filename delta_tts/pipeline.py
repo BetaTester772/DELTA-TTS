@@ -51,14 +51,17 @@ class DeltaTTSPipeline:
         backbone_dir: CosyVoice 3 model directory (Fun-CosyVoice3-0.5B-2512).
         checkpoint: Path to the DELTA-TTS checkpoint `delta_tts.pt`.
         device: Torch device for DELTA-TTS and the CosyVoice 3 decoder. `default_device()` when None.
+        audio_processor: Optional `delta_tts.audio.AudioProcessor` (Silero VAD, RE-USE) applied
+            to the prompt before and to the output after synthesis.
     """
 
-    def __init__(self, backbone_dir: str, checkpoint: str, device: str | None = None) -> None:
+    def __init__(self, backbone_dir: str, checkpoint: str, device: str | None = None, audio_processor=None) -> None:
         self.device = torch.device(device or default_device())
         self.model = DeltaTTS(backbone_dir).to(self.device).float().eval()
         self.model.load_checkpoint(checkpoint)
         self.cosyvoice = CosyVoice3(backbone_dir)
         self.sample_rate = self.cosyvoice.sample_rate  # 24 kHz
+        self.audio_processor = audio_processor
         if self.device.type == "mps":
             _move_decoder_to_mps(self.cosyvoice.model, self.device)
 
@@ -76,6 +79,13 @@ class DeltaTTSPipeline:
         Returns:
             Waveform at `self.sample_rate`. Shape: (1, num_samples)
         """
+        if self.audio_processor is None:
+            return self._synthesize(text, prompt_wav, prompt_text, speech_len, **decoding)
+        with self.audio_processor.prepare_prompt(prompt_wav) as processed_prompt_wav:
+            wav = self._synthesize(text, processed_prompt_wav, prompt_text, speech_len, **decoding)
+        return self.audio_processor.process_output(wav, self.sample_rate)
+
+    def _synthesize(self, text: str, prompt_wav: str, prompt_text: str, speech_len: int | None, **decoding) -> torch.Tensor:
         frontend = self.cosyvoice.frontend
 
         # -----------------------------

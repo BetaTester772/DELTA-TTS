@@ -16,6 +16,7 @@ import torchaudio
 from tqdm import tqdm
 
 from delta_tts import DeltaTTSPipeline
+from delta_tts.pipeline import default_device
 
 logger = logging.getLogger("delta_tts")
 
@@ -37,6 +38,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num_steps", type=int, default=16)
     parser.add_argument("--temperature", type=float, default=0.0, help="0 takes the most likely token; above 0 samples")
     parser.add_argument("--device", default=None, help="cuda, mps or cpu; by default CUDA, then MPS, then CPU")
+    # audio processing (`audio` extra): RE-USE speech enhancement and Silero VAD
+    parser.add_argument("--enhance_prompt", action="store_true", help="enhance the prompt with RE-USE")
+    parser.add_argument("--trim_prompt", action="store_true", help="trim leading/trailing non-speech of the prompt with Silero VAD")
+    parser.add_argument("--trim_output", action="store_true", help="trim leading/trailing non-speech of the output with Silero VAD")
+    parser.add_argument("--reuse_dir", default="nvidia/NVIDIA-NemotronLabs-RE-USE", help="RE-USE directory or Hugging Face repo id")
     return parser.parse_args()
 
 
@@ -45,9 +51,15 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
     # -----------------------------
-    # Load DELTA-TTS and CosyVoice 3
+    # Load DELTA-TTS, CosyVoice 3 and the optional audio processing
     # -----------------------------
-    tts = DeltaTTSPipeline(args.backbone_dir, args.checkpoint, args.device)
+    device = args.device or default_device()
+    audio_processor = None
+    if args.enhance_prompt or args.trim_prompt or args.trim_output:
+        from delta_tts.audio import AudioProcessor
+
+        audio_processor = AudioProcessor(args.enhance_prompt, args.trim_prompt, args.trim_output, args.reuse_dir, device)
+    tts = DeltaTTSPipeline(args.backbone_dir, args.checkpoint, device, audio_processor)
     decoding = {"num_steps": args.num_steps, "temperature": args.temperature}
 
     # -----------------------------

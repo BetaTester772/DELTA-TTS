@@ -34,6 +34,9 @@ uv sync --extra mac
 DELTA-TTS and the CosyVoice 3 flow decoder then run on MPS; the vocoder, whose F0 predictor needs float64, and the ONNX frontend run on the CPU.
 `--device` defaults to CUDA, then MPS, then CPU.
 
+**Audio processing (optional).** The `audio` extra adds [Silero VAD](https://github.com/snakers4/silero-vad) and [NVIDIA RE-USE](https://huggingface.co/nvidia/NVIDIA-NemotronLabs-RE-USE) speech enhancement (`uv sync --extra audio`, or `--extra mac --extra audio`).
+RE-USE runs on a pure-PyTorch Mamba port (`delta_tts/reuse.py`, with a Metal kernel on MPS), so `mamba-ssm` is not needed.
+
 ## Checkpoints
 
 | Model | Backbone | Trainable modules | Training data | Download |
@@ -65,6 +68,20 @@ uv run python infer.py --meta third_party/F5-TTS/data/seedtts_testset/en/meta.ls
 
 The output length is estimated with the length rule of [OmniVoice](https://github.com/k2-fsa/OmniVoice).
 
+With the `audio` extra, the prompt can be cleaned before synthesis and the output trimmed after it (all off by default; the paper results use none):
+
+| Flag | Effect |
+|---|---|
+| `--enhance_prompt` | Enhance the prompt with RE-USE (noise, reverberation, codec artifacts, ...) |
+| `--trim_prompt` | Trim leading and trailing non-speech of the prompt with Silero VAD |
+| `--trim_output` | Trim leading and trailing non-speech of the output with Silero VAD |
+
+Only leading and trailing non-speech is removed, so the prompt transcript stays valid. The same processing on a single file:
+
+```bash
+uv run python -m delta_tts.audio noisy.wav clean.wav --enhance --trim
+```
+
 ## Evaluation
 
 WER and SIM are computed with the [evaluation code of F5-TTS](https://github.com/SWivid/F5-TTS/tree/main/src/f5_tts/eval), included as a submodule and used without modification.
@@ -77,6 +94,7 @@ bash eval.sh outputs/seedtts_en
 ## Acknowledgement
 
 This work builds on [CosyVoice](https://github.com/FunAudioLLM/CosyVoice) (backbone, speech tokenizer, flow-matching decoder and vocoder), [F5-TTS](https://github.com/SWivid/F5-TTS) (evaluation code) and [OmniVoice](https://github.com/k2-fsa/OmniVoice) (length estimation rule).
+The optional audio processing uses [Silero VAD](https://github.com/snakers4/silero-vad) and [NVIDIA NemotronLabs RE-USE](https://huggingface.co/nvidia/NVIDIA-NemotronLabs-RE-USE).
 We thank the authors for releasing their work.
 
 ## Citation
@@ -95,3 +113,4 @@ We thank the authors for releasing their work.
 
 The code is released under the Apache-2.0 license.
 The model weights are built on CosyVoice 3 and follow its Apache-2.0 license.
+`delta_tts/reuse.py` is a port of the RE-USE code and follows its OpenMDW-1.1 license, as do the RE-USE weights.

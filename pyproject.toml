@@ -47,6 +47,12 @@ dependencies = [
 mac = [
     "onnxruntime==1.24.4; sys_platform == 'darwin'",
 ]
+# Audio processing around DELTA-TTS (delta_tts/audio.py): Silero VAD and NVIDIA RE-USE speech enhancement.
+# RE-USE runs on a pure-PyTorch Mamba port, so mamba-ssm is not needed.
+audio = [
+    "silero-vad==6.3",
+    "safetensors",
+]
 
 [tool.uv]
 package = false
