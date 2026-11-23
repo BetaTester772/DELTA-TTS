@@ -8,7 +8,9 @@ Endpoints (JSON)
     GET  /health       status ("loading", "ready" or "error"), device, compute, sample_rate, dry_run
     GET  /config       the config, with preset paths resolved
     POST /synthesize   text and prompt in; base64 WAV, timing and warnings out
-    POST /reset        forget the previous visitor: uploaded prompts and cached prompt features
+    POST /prepare      prompt in; processes it (VAD trim, enhancement) and caches its features, so that
+                       a later /synthesize with the returned prompt_id does no prompt processing
+    POST /reset        forget the previous visitor: uploaded and prepared prompts, cached prompt features
 
 Every notice in "warnings" is {level: "info" | "warning" | "error", code, message}. A request
 that cannot be served gets an HTTP 4xx/5xx status and {error, code, warnings}.
@@ -76,6 +78,7 @@ AUDIO_ERRORS = (OSError, RuntimeError, EOFError, ValueError, ArithmeticError, wa
 DRY_RUN_SAMPLE_RATE = 24000
 DRY_RUN_LOAD_SECONDS = 1.0  # simulated model loading, so that clients see the "loading" state
 DRY_RUN_SYNTHESIS_SECONDS = 0.5  # simulated synthesis time
+DRY_RUN_PREPARE_SECONDS = 0.8  # simulated prompt processing
 
 logger = logging.getLogger("demo.server")
 
@@ -313,33 +316,67 @@ def dry_run_tone(seconds: float, sample_rate: int = DRY_RUN_SAMPLE_RATE) -> byte
 # -----------------------------
 # Requests
 # -----------------------------
-@dataclass
-class SynthesisRequest:
-    """A validated /synthesize request; unset fields take the config defaults."""
+class PreparedPrompts:
+    """Prompts processed by /prepare, by an opaque id: the content hash of the audio, so that the
+    id of an upload matches its file in the upload store. Responses never contain paths."""
 
-    text: str
-    prompt_text: str
+    def __init__(self) -> None:
+        self._paths: dict[str, Path] = {}
+
+    def register(self, path: Path) -> str:
+        prompt_id = hashlib.sha256(path.read_bytes()).hexdigest()[:32]
+        self._paths[prompt_id] = path
+        return prompt_id
+
+    def path(self, prompt_id: str) -> Path:
+        """The prompt file of `prompt_id`. Raises: RequestError when it is unknown or gone (e.g. the
+        server restarted, /reset was called or the upload was evicted)."""
+        path = self._paths.get(prompt_id)
+        if path is None or not path.is_file():
+            self._paths.pop(prompt_id, None)
+            raise RequestError(HTTPStatus.NOT_FOUND, "prompt_unknown",
+                               "Unknown prompt_id; send the prompt audio again.")
+        return path
+
+    def clear(self) -> int:
+        removed = len(self._paths)
+        self._paths.clear()
+        return removed
+
+
+@dataclass
+class PromptSpec:
+    """The prompt part of a request: its audio, transcript, processing and warning thresholds."""
+
     prompt_wav: Path
-    length_scale: float
-    decoding: dict[str, Any]  # num_steps, temperature, top_p, t_shift
-    compute: str
+    prompt_text: str
     processing: tuple[bool, bool, bool]  # enhance_prompt, trim_prompt, trim_output
     thresholds: dict[str, float]
 
 
-def parse_request(body: dict[str, Any], config: dict[str, Any], uploads: UploadStore,
-                  prompt_roots: list[Path]) -> SynthesisRequest:
-    """Validate the request body and fill in the defaults of the config."""
-    synthesis, processing = config["synthesis"], config["processing"]
-    overrides = body.get("warnings") or {}
-    if not isinstance(overrides, dict):
-        raise bad_request("invalid_parameter", "warnings must be an object of thresholds")
+@dataclass
+class SynthesisRequest(PromptSpec):
+    """A validated /synthesize request; unset fields take the config defaults."""
 
-    def get(key: str, defaults: dict[str, Any], source: dict[str, Any] = body) -> Any:
-        """`source[key]`, or the default when it is missing or null."""
-        value = source.get(key)
+    text: str
+    length_scale: float
+    decoding: dict[str, Any]  # num_steps, temperature, top_p, t_shift
+    compute: str
+
+
+class Fields:
+    """Typed fields of a request body, with defaults from the config."""
+
+    def __init__(self, body: dict[str, Any], config: dict[str, Any]) -> None:
+        self.body = body
+        self.config = config
+
+    def get(self, key: str, defaults: dict[str, Any], source: dict[str, Any] | None = None) -> Any:
+        """`source[key]` (the body by default), or the default when it is missing or null."""
+        value = (self.body if source is None else source).get(key)
         return defaults[key] if value is None else value
 
+    @staticmethod
     def number(key: str, value: Any, valid: Callable[[float], bool], requirement: str) -> float:
         if isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(value):
             raise bad_request("invalid_parameter", f"{key} must be a number, got {value!r}")
@@ -347,48 +384,75 @@ def parse_request(body: dict[str, Any], config: dict[str, Any], uploads: UploadS
             raise bad_request("invalid_parameter", f"{key} must be {requirement}, got {value!r}")
         return float(value)
 
-    def string(key: str) -> str:
-        value = get(key, {key: ""})
+    def string(self, key: str) -> str:
+        value = self.get(key, {key: ""})
         if not isinstance(value, str):
             raise bad_request("invalid_parameter", f"{key} must be a string")
         return value
 
-    num_steps = number("num_steps", get("num_steps", synthesis), lambda v: 1 <= v <= 256 and v == int(v),
-                       "an integer in [1, 256]")
-    compute = get("compute", synthesis)
+    def processing(self) -> tuple[bool, bool, bool]:
+        flags = []
+        for key in PROCESSING_KEYS:
+            value = self.get(key, self.config["processing"])
+            if not isinstance(value, bool):
+                raise bad_request("invalid_parameter", f"{key} must be true or false, got {value!r}")
+            flags.append(value)
+        return flags[0], flags[1], flags[2]
+
+    def thresholds(self) -> dict[str, float]:
+        overrides = self.body.get("warnings") or {}
+        if not isinstance(overrides, dict):
+            raise bad_request("invalid_parameter", "warnings must be an object of thresholds")
+        return {key: self.number(key, self.get(key, self.config["warnings"], overrides), lambda v: v >= 0, "at least 0")
+                for key in self.config["warnings"]}
+
+
+def parse_prompt(body: dict[str, Any], config: dict[str, Any], uploads: UploadStore, prompt_roots: list[Path],
+                 prepared: PreparedPrompts) -> PromptSpec:
+    """Validate the prompt part of a request (all that /prepare takes)."""
+    fields = Fields(body, config)
+    return PromptSpec(prompt_wav=resolve_prompt(body, uploads, prompt_roots, prepared),
+                      prompt_text=fields.string("prompt_text"), processing=fields.processing(),
+                      thresholds=fields.thresholds())
+
+
+def parse_request(body: dict[str, Any], config: dict[str, Any], uploads: UploadStore, prompt_roots: list[Path],
+                  prepared: PreparedPrompts) -> SynthesisRequest:
+    """Validate a /synthesize request body and fill in the defaults of the config."""
+    fields, synthesis = Fields(body, config), config["synthesis"]
+    num_steps = fields.number("num_steps", fields.get("num_steps", synthesis), lambda v: 1 <= v <= 256 and v == int(v),
+                              "an integer in [1, 256]")
+    compute = fields.get("compute", synthesis)
     if compute not in COMPUTE_MODES:
         raise bad_request("invalid_parameter", f"compute must be 'exact' or 'fast', got {compute!r}")
-    flags = []
-    for key in PROCESSING_KEYS:
-        value = get(key, processing)
-        if not isinstance(value, bool):
-            raise bad_request("invalid_parameter", f"{key} must be true or false, got {value!r}")
-        flags.append(value)
-    thresholds = {key: number(key, get(key, config["warnings"], overrides), lambda v: v >= 0, "at least 0")
-                  for key in config["warnings"]}
-
+    prompt = parse_prompt(body, config, uploads, prompt_roots, prepared)
     return SynthesisRequest(
-        text=string("text"),
-        prompt_text=string("prompt_text"),
-        prompt_wav=resolve_prompt(body, uploads, prompt_roots),
-        length_scale=number("length_scale", get("length_scale", synthesis), lambda v: 0 < v <= 10, "in (0, 10]"),
+        prompt_wav=prompt.prompt_wav,
+        prompt_text=prompt.prompt_text,
+        processing=prompt.processing,
+        thresholds=prompt.thresholds,
+        text=fields.string("text"),
+        length_scale=fields.number("length_scale", fields.get("length_scale", synthesis), lambda v: 0 < v <= 10, "in (0, 10]"),
         decoding={
             "num_steps": int(num_steps),
-            "temperature": number("temperature", get("temperature", synthesis), lambda v: v >= 0, "at least 0"),
-            "top_p": number("top_p", get("top_p", synthesis), lambda v: 0 < v <= 1, "in (0, 1]"),
-            "t_shift": number("t_shift", get("t_shift", synthesis), lambda v: v > 0, "above 0"),
+            "temperature": fields.number("temperature", fields.get("temperature", synthesis), lambda v: v >= 0, "at least 0"),
+            "top_p": fields.number("top_p", fields.get("top_p", synthesis), lambda v: 0 < v <= 1, "in (0, 1]"),
+            "t_shift": fields.number("t_shift", fields.get("t_shift", synthesis), lambda v: v > 0, "above 0"),
         },
         compute=compute,
-        processing=(flags[0], flags[1], flags[2]),
-        thresholds=thresholds,
     )
 
 
-def resolve_prompt(body: dict[str, Any], uploads: UploadStore, prompt_roots: list[Path]) -> Path:
-    """The prompt audio file: an upload (`prompt_wav_base64`) or a path (`prompt_wav_path`) that
-    resolves, symlinks included, inside one of `prompt_roots`. Responses never name the
-    resolved path; the details are logged."""
-    data, path = body.get("prompt_wav_base64"), body.get("prompt_wav_path")
+def resolve_prompt(body: dict[str, Any], uploads: UploadStore, prompt_roots: list[Path],
+                   prepared: PreparedPrompts) -> Path:
+    """The prompt audio file: a prepared prompt (`prompt_id`), an upload (`prompt_wav_base64`) or a
+    path (`prompt_wav_path`) that resolves, symlinks included, inside one of `prompt_roots`.
+    Responses never name the resolved path; the details are logged."""
+    prompt_id, data, path = body.get("prompt_id"), body.get("prompt_wav_base64"), body.get("prompt_wav_path")
+    if prompt_id:
+        if not isinstance(prompt_id, str) or len(prompt_id) > 64 or not prompt_id.isalnum():
+            raise bad_request("invalid_parameter", "prompt_id must be the id returned by /prepare")
+        return prepared.path(prompt_id)
     if data:
         if not isinstance(data, str):
             raise bad_request("invalid_parameter", "prompt_wav_base64 must be a string")
@@ -414,29 +478,19 @@ def resolve_prompt(body: dict[str, Any], uploads: UploadStore, prompt_roots: lis
             logger.warning("prompt_wav_path %r: %s is not a file", path, resolved)
             raise bad_request("prompt_not_found", "Prompt audio not found.")
         return resolved
-    raise bad_request("prompt_missing", "No prompt audio: give prompt_wav_path or prompt_wav_base64.")
+    raise bad_request("prompt_missing", "No prompt audio: give prompt_id, prompt_wav_base64 or prompt_wav_path.")
 
 
-def check_request(request: SynthesisRequest, notices: list[Notice]) -> float:
-    """Checks before synthesis. Problems that would fail synthesis raise `RequestError`; the
-    others are appended to `notices`.
-
-    Returns:
-        The estimated output duration in seconds.
-    """
-    limits = request.thresholds
-    if not request.text.strip():
-        raise bad_request("text_empty", "The text to synthesize is empty.")
-    if len(request.text) > limits["max_text_chars"]:
-        notices.append(notice("warning", "text_long",
-                              f"The text has {len(request.text)} characters (more than {limits['max_text_chars']:g}). "
-                              "DELTA-TTS generates the whole utterance at once; consider splitting long text into sentences."))
-    if not request.prompt_text.strip():
+def check_transcript(prompt_text: str, notices: list[Notice]) -> None:
+    if not prompt_text.strip():
         notices.append(notice("warning", "transcript_missing",
                               "No prompt transcript. DELTA-TTS expects the words spoken in the prompt, and the output "
                               "length falls back to a default speaking rate; expect lower quality."))
 
-    enhance, trim_prompt, trim_output = request.processing
+
+def check_processing(processing: tuple[bool, bool, bool]) -> None:
+    """Raise if the requested prompt/output processing needs packages that are not installed."""
+    enhance, trim_prompt, trim_output = processing
     needed = (["safetensors"] if enhance else []) + (["silero_vad"] if trim_prompt or trim_output else [])
     missing = [module for module in needed if importlib.util.find_spec(module) is None]
     if missing:
@@ -444,10 +498,19 @@ def check_request(request: SynthesisRequest, notices: list[Notice]) -> float:
                           f"Prompt/output processing needs the `audio` extra ({', '.join(missing)} not installed): "
                           "uv sync --extra audio (on macOS: uv sync --extra mac --extra audio).")
 
+
+def check_prompt_audio(prompt: PromptSpec, notices: list[Notice]) -> float:
+    """Checks of the prompt audio. Problems that would fail synthesis raise `RequestError`; the
+    others are appended to `notices`.
+
+    Returns:
+        The duration of the prompt file in seconds (before any trimming).
+    """
+    limits, trim_prompt = prompt.thresholds, prompt.processing[1]
     try:
-        prompt_seconds, sample_rate = audio_info(request.prompt_wav)
+        prompt_seconds, sample_rate = audio_info(prompt.prompt_wav)
     except AUDIO_ERRORS as e:
-        logger.info("Cannot read the prompt %s: %s: %s", request.prompt_wav, type(e).__name__, e)
+        logger.info("Cannot read the prompt %s: %s: %s", prompt.prompt_wav, type(e).__name__, e)
         raise bad_request("prompt_unreadable", "Cannot read the prompt audio; use a WAV or FLAC file.") from None
     if sample_rate < MIN_PROMPT_SAMPLE_RATE:
         raise bad_request("prompt_low_sample_rate",
@@ -469,6 +532,26 @@ def check_request(request: SynthesisRequest, notices: list[Notice]) -> float:
                               f"The prompt is {prompt_seconds:.1f} s long (over {limits['max_prompt_seconds']:g} s); "
                               "a long prompt slows synthesis, and CosyVoice 3 rejects prompts over "
                               f"{MAX_PROMPT_SECONDS} s after trimming."))
+    return prompt_seconds
+
+
+def check_request(request: SynthesisRequest, notices: list[Notice]) -> float:
+    """Checks before synthesis. Problems that would fail synthesis raise `RequestError`; the
+    others are appended to `notices`.
+
+    Returns:
+        The estimated output duration in seconds.
+    """
+    limits = request.thresholds
+    if not request.text.strip():
+        raise bad_request("text_empty", "The text to synthesize is empty.")
+    if len(request.text) > limits["max_text_chars"]:
+        notices.append(notice("warning", "text_long",
+                              f"The text has {len(request.text)} characters (more than {limits['max_text_chars']:g}). "
+                              "DELTA-TTS generates the whole utterance at once; consider splitting long text into sentences."))
+    check_transcript(request.prompt_text, notices)
+    check_processing(request.processing)
+    prompt_seconds = check_prompt_audio(request, notices)
 
     estimate = estimate_output_seconds(request.text, request.prompt_text, prompt_seconds, request.length_scale)
     if estimate > limits["max_output_seconds"]:
@@ -501,8 +584,9 @@ class TTSService:
         self.tts: Any = None  # DeltaTTSPipeline
         self._fast_forward: Any = None  # ReducedPrecisionForward, created on first use
         self._processors: dict[tuple[bool, bool, bool], Any] = {}  # AudioProcessor per setting
-        self._lock = threading.Lock()  # one synthesis at a time
+        self._lock = threading.Lock()  # one synthesis or prompt preparation at a time
         self.uploads = UploadStore()
+        self.prepared = PreparedPrompts()
         # Directories that prompt_wav_path may point into
         preset_dirs = {resolve(preset["wav"]).resolve().parent for preset in config["presets"]}
         self.prompt_roots = [REPO_ROOT, self.uploads.dir, *sorted(preset_dirs - {REPO_ROOT})]
@@ -564,26 +648,97 @@ class TTSService:
         return config
 
     def reset(self) -> dict[str, Any]:
-        """Forget the previous visitor: delete the uploaded prompts and clear the pipeline's
-        cached prompt features, which include speaker embeddings. Waits for a running synthesis."""
+        """Forget the previous visitor: delete the uploaded prompts, forget the prepared ones and
+        clear the pipeline's cached prompt features, which include speaker embeddings. Waits for a
+        running synthesis or preparation."""
         with self._lock:
             removed = self.uploads.clear()
+            forgotten = self.prepared.clear()
             cleared = 0
             if self.tts is not None:
                 cleared = len(self.tts._prompt_cache)
                 self.tts._prompt_cache.clear()
-        logger.info("Reset: removed %d uploaded prompts and %d cached prompt features", removed, cleared)
-        return {"status": "ok", "removed_uploads": removed, "cleared_prompt_features": cleared}
+        logger.info("Reset: removed %d uploaded prompts, forgot %d prepared prompts, cleared %d cached prompt features",
+                    removed, forgotten, cleared)
+        return {"status": "ok", "removed_uploads": removed, "forgotten_prompts": forgotten,
+                "cleared_prompt_features": cleared}
 
-    def synthesize(self, body: dict[str, Any], notices: list[Notice]) -> dict[str, Any]:
-        """Serve one /synthesize request. Notices are appended to `notices` as they arise."""
+    def _check_ready(self) -> None:
         if self.status == "loading":
             raise RequestError(HTTPStatus.SERVICE_UNAVAILABLE, "server_loading",
                                "The model is still loading; try again in a moment.")
         if self.status == "error":
             raise RequestError(HTTPStatus.SERVICE_UNAVAILABLE, "server_failed", f"The model failed to load: {self.error}")
+
+    def prepare(self, body: dict[str, Any], notices: list[Notice]) -> dict[str, Any]:
+        """Serve one /prepare request: store the prompt, process it (Silero VAD trim, RE-USE
+        enhancement) and extract its features into the pipeline's prompt cache, exactly as
+        /synthesize would, so that a /synthesize with the returned `prompt_id`, the same transcript
+        and the same processing does no prompt processing. A /synthesize that arrives meanwhile
+        waits for the lock and then finds the cache warm."""
+        self._check_ready()
         with self._lock:
-            request = parse_request(body, self.config, self.uploads, self.prompt_roots)
+            prompt = parse_prompt(body, self.config, self.uploads, self.prompt_roots, self.prepared)
+            check_transcript(prompt.prompt_text, notices)
+            check_processing(prompt.processing)
+            seconds = check_prompt_audio(prompt, notices)
+            prompt_id = self.prepared.register(prompt.prompt_wav)
+            if self.dry_run:
+                time.sleep(DRY_RUN_PREPARE_SECONDS)
+                processed = seconds  # no trimming in the dry run
+                self.processing = prompt.processing
+                notices.append(notice("info", "dry_run_prepare",
+                                      "Dry run: the prompt is registered, but not trimmed or enhanced."))
+            else:
+                processed = self._prepare_model(prompt, notices)
+        limits = prompt.thresholds
+        if processed < limits["min_prompt_seconds"] and not any(n["code"] == "prompt_short" for n in notices):
+            notices.append(notice("warning", "prompt_short",
+                                  f"After removing silence, the recording is {processed:.1f} s long "
+                                  f"(under {limits['min_prompt_seconds']:g} s); record again and read the whole sentence."))
+        return {"prompt_id": prompt_id, "duration_s": round(processed, 3), "dry_run": self.dry_run,
+                "warnings": notices}
+
+    def _prepare_model(self, prompt: PromptSpec, notices: list[Notice]) -> float:
+        """Process the prompt into the prompt cache. Returns its duration after processing, in seconds."""
+        import torch
+
+        logs = LogCollector()
+        try:
+            with logs:
+                self._set_processing(prompt.processing)
+                with torch.no_grad():
+                    features = self._warm_prompt_cache(prompt.prompt_wav, prompt.prompt_text)
+        finally:
+            self._library_notices(logs.records, notices)
+        return features["untrimmed_speech_len"] / SPEECH_TOKEN_RATE
+
+    def _warm_prompt_cache(self, prompt_wav: Path, prompt_text: str) -> dict[str, Any]:
+        """Run the prompt half of `DeltaTTSPipeline.synthesize` (processing, speech tokens, mel,
+        speaker embedding) and keep the result in the pipeline's prompt cache. This warms the cache
+        through the private `_prompt`; a public pipeline method will replace this call."""
+        return self.tts._prompt(str(prompt_wav), prompt_text)
+
+    @staticmethod
+    def _library_notices(records: list[logging.LogRecord], notices: list[Notice],
+                         skip_precision: bool = False) -> None:
+        """Turn the library's logged warnings into notices."""
+        for record in records:
+            if skip_precision and record.name == "delta_tts.precision":
+                continue
+            message = record.getMessage()
+            if record.name == "delta_tts.audio" and "no speech" in message:
+                notices.append(notice("warning", "prompt_no_speech",
+                                      "No speech was found in the recording; record again closer to the microphone."))
+                continue
+            level = "error" if record.levelno >= logging.ERROR else "warning"
+            notices.append(notice(level, "library", message))
+
+    def synthesize(self, body: dict[str, Any], notices: list[Notice]) -> dict[str, Any]:
+        """Serve one /synthesize request. Notices are appended to `notices` as they arise."""
+        self._check_ready()
+        with self._lock:
+            request = parse_request(body, self.config, self.uploads, self.prompt_roots, self.prepared)
             estimate = check_request(request, notices)
             if self.dry_run:
                 pcm, elapsed, fell_back = self._synthesize_dry_run(request, estimate, notices)
@@ -629,11 +784,7 @@ class TTSService:
                 elapsed = time.perf_counter() - start
         finally:  # the library's warnings are reported also when synthesis fails
             fell_back = bool(getattr(self.tts.forward, "in_fallback", False))
-            for record in logs.records:
-                if fell_back and record.name == "delta_tts.precision":
-                    continue  # reported below
-                level = "error" if record.levelno >= logging.ERROR else "warning"
-                notices.append(notice(level, "library", record.getMessage()))
+            self._library_notices(logs.records, notices, skip_precision=fell_back)  # the fallback is reported below
         if fell_back:
             notices.append(notice("warning", "fast_fallback",
                                   "float16 overflowed in this utterance, so it was finished in float32; "
@@ -668,10 +819,12 @@ class TTSService:
 
                 enhance, trim_prompt, trim_output = processing
                 logger.info("Loading audio processing: %s", dict(zip(PROCESSING_KEYS, processing, strict=True)))
+                reuse_dir = self.config["server"].get("reuse_dir", "nvidia/NVIDIA-NemotronLabs-RE-USE")
+                if resolve(reuse_dir).is_dir():  # a local directory (else a Hugging Face repo id)
+                    reuse_dir = str(resolve(reuse_dir))
                 self._processors[processing] = AudioProcessor(
                     enhance_prompt=enhance, trim_prompt=trim_prompt, trim_output=trim_output,
-                    reuse_dir=self.config["server"].get("reuse_dir", "nvidia/NVIDIA-NemotronLabs-RE-USE"),
-                    device=self.device or "cpu")
+                    reuse_dir=reuse_dir, device=self.device or "cpu")
             self.tts.audio_processor = self._processors[processing]
         else:
             self.tts.audio_processor = None
@@ -719,6 +872,8 @@ class Handler(BaseHTTPRequestHandler):
             self._check_client()
             if path == "/synthesize":
                 result = self.service.synthesize(self._read_json(), notices)
+            elif path == "/prepare":
+                result = self.service.prepare(self._read_json(), notices)
             elif path == "/reset":
                 self._read_json()  # same Content-Type and size checks as /synthesize; the body is ignored
                 result = self.service.reset()
@@ -728,7 +883,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send_error(e, notices)
         except Exception as e:
             logger.exception("%s failed", path)
-            code, what = ("synthesis_failed", "Synthesis") if path == "/synthesize" else ("reset_failed", "Reset")
+            code, what = {"/synthesize": ("synthesis_failed", "Synthesis"),
+                          "/prepare": ("prepare_failed", "Preparing the prompt")}.get(path, ("reset_failed", "Reset"))
             error = RequestError(HTTPStatus.INTERNAL_SERVER_ERROR, code, f"{what} failed: {type(e).__name__}: {e}")
             self._send_error(error, notices)
         else:
