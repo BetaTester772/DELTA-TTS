@@ -5,7 +5,8 @@ What this file contains
     ConvModule       local-mixing block added after every transformer block
     BidirectionalEncoder
                      runs the Qwen2 backbone with full (non-causal) attention
-    DeltaTTS         the whole speech-token model; `logits()` is its only inference entry point
+    DeltaTTS         the whole speech-token model; `logits()` is its inference entry point
+                     (`embed()` gives its input embeddings, for the Core ML backend)
 
 How the model sees one utterance
     [SOS] [text tokens] [TASK] [prompt speech tokens] [MASK ... MASK] [EOS]
@@ -206,6 +207,19 @@ class DeltaTTS(nn.Module):
             Logits; the logit at position i predicts the token at position i + 1.
             Shape: (1, seq_len, vocab_size) with seq_len = 1 + text_len + 1 + speech_seq_len
         """
+        hidden = self.bidirectional_encoder(self.embed(text_token, speech_token))  # (1, seq_len, hidden_dim)
+        return self.llm_decoder(hidden)  # (1, seq_len, vocab_size)
+
+    @torch.no_grad()
+    def embed(self, text_token: torch.Tensor, speech_token: torch.Tensor) -> torch.Tensor:
+        """Input embeddings of the sequence [SOS, text, TASK, speech].
+
+        Args:
+            text_token: Text token ids. Shape: (1, text_len)
+            speech_token: Speech token ids, MASK_TOKEN where masked. Shape: (1, speech_seq_len)
+        Returns:
+            Embeddings. Shape: (1, seq_len, hidden_dim) with seq_len = 1 + text_len + 1 + speech_seq_len
+        """
         # Text: Qwen2 token embeddings.
         text_emb = self.bidirectional_encoder.embed_tokens(text_token)  # (1, text_len, hidden_dim)
 
@@ -217,10 +231,7 @@ class DeltaTTS(nn.Module):
         # [SOS] text [TASK] speech
         sos = self.speech_embedding.weight[SOS_TOKEN].view(1, 1, -1)  # (1, 1, hidden_dim)
         task = self.speech_embedding.weight[TASK_TOKEN].view(1, 1, -1)  # (1, 1, hidden_dim)
-        sequence = torch.cat([sos, text_emb, task, speech_emb], dim=1)  # (1, seq_len, hidden_dim)
-
-        hidden = self.bidirectional_encoder(sequence)  # (1, seq_len, hidden_dim)
-        return self.llm_decoder(hidden)  # (1, seq_len, vocab_size)
+        return torch.cat([sos, text_emb, task, speech_emb], dim=1)  # (1, seq_len, hidden_dim)
 
 
 class _AfterBlock:
