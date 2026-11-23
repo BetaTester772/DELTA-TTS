@@ -24,11 +24,13 @@ enum MicrophoneAccess: Equatable {
 struct Take: Equatable {
     var url: URL
     var duration: TimeInterval
+    var speechDuration: TimeInterval  // from the first to the last frame with speech (0: none found)
     var peakDecibels: Double  // loudest 20 ms frame, dBFS
 }
 
 /// Records the visitor's voice: a countdown, then mono 16-bit WAV from the given microphone
-/// until Stop or the time limit, then leading and trailing silence is cut. It records through
+/// until Stop or the time limit. Leading and trailing silence is cut when asked (when the server
+/// trims the prompt itself, the full recording is kept, so that its enhancement sees the noise). It records through
 /// AVCaptureSession, which, unlike AVAudioRecorder, can record from a chosen device.
 ///
 /// Recordings live in a private temporary directory (mode 0700) that `deleteAll` empties and
@@ -213,7 +215,8 @@ final class VoiceRecorder {
         do {
             let analysis = try SilenceTrimmer.process(input: raw, output: final, trim: trimSilence)
             try? FileManager.default.removeItem(at: raw)
-            let take = Take(url: final, duration: analysis.duration, peakDecibels: analysis.peakDecibels)
+            let take = Take(url: final, duration: analysis.duration, speechDuration: analysis.speechDuration,
+                            peakDecibels: analysis.peakDecibels)
             self.take = take
             onTake?(take)
         } catch {
@@ -304,14 +307,16 @@ private struct UncheckedSendable<Value>: @unchecked Sendable {
 /// measures it. Energy-based: frames well above the noise floor and near the peak are speech.
 enum SilenceTrimmer {
     struct Analysis {
-        var duration: TimeInterval
+        var duration: TimeInterval  // of the written file
+        var speechDuration: TimeInterval  // of the detected speech, without margins (0: none found)
         var peakDecibels: Double
     }
 
     static let frameSeconds = 0.02
     static let marginSeconds = 0.25
 
-    /// Write `input` to `output`, trimmed when `trim` and speech is found. Both are WAV files.
+    /// Write `input` to `output`, trimmed when `trim` and speech is found, and measure the speech
+    /// either way. Both are WAV files.
     static func process(input: URL, output: URL, trim: Bool) throws -> Analysis {
         let file = try AVAudioFile(forReading: input)
         let format = file.processingFormat  // float32, non-interleaved
@@ -333,8 +338,10 @@ enum SilenceTrimmer {
         }
         let peak = energies.max() ?? -120
 
+        let speech = speechFrames(energies: energies, peak: peak)
+        let speechDuration = speech.map { Double($0.count * window) / rate } ?? 0
         var range = 0..<samples.count
-        if trim, let speech = speechFrames(energies: energies, peak: peak) {
+        if trim, let speech {
             let margin = Int(rate * marginSeconds)
             let start = max(0, speech.lowerBound * window - margin)
             let end = min(samples.count, speech.upperBound * window + margin)
@@ -349,7 +356,7 @@ enum SilenceTrimmer {
         target.update(from: channel + range.lowerBound, count: range.count)
         slice.frameLength = count
         try out.write(from: slice)
-        return Analysis(duration: Double(range.count) / rate, peakDecibels: peak)
+        return Analysis(duration: Double(range.count) / rate, speechDuration: speechDuration, peakDecibels: peak)
     }
 
     /// Frames from the first to the last one that counts as speech: within 35 dB of the peak

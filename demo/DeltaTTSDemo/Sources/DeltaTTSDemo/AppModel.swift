@@ -108,6 +108,8 @@ final class AppModel {
     @ObservationIgnored private var synthesisTask: Task<Void, Never>?
     @ObservationIgnored private var progressTask: Task<Void, Never>?
     private(set) var prepareNotices: [Notice] = []
+    /// The processed prompt from /prepare, which "Play my recording" plays: what the model uses.
+    @ObservationIgnored private var preparedAudio: Data?
     @ObservationIgnored private var prepareToken = UUID()  // tags a prepare; a later one makes it stale
     @ObservationIgnored private var preparedKey = ""  // the prompt, transcript and processing it was for
     private(set) var serverNotices: [Notice] = []
@@ -208,6 +210,8 @@ final class AppModel {
         let token = UUID()
         prepareToken = token
         prepareNotices = []
+        promptPlayer.unload()
+        preparedAudio = nil
         guard let promptURL, let client else {
             prepareState = .idle
             return
@@ -227,6 +231,7 @@ final class AppModel {
                                              trimPrompt: p.trimPrompt, trimOutput: p.trimOutput, warnings: warnings)
                 let response = try await client.prepare(request)
                 guard token == prepareToken else { return }
+                preparedAudio = response.audioWavBase64.flatMap { Data(base64Encoded: $0) }
                 prepareState = .ready(id: response.promptId, seconds: response.durationSeconds)
                 prepareNotices = response.warnings.filter { $0.level != .info }
             } catch {
@@ -242,16 +247,12 @@ final class AppModel {
     /// Forget any prepare in progress or done (a new recording, Next visitor).
     private func dropPrepare() {
         prepareTask?.cancel()
+        promptPlayer.unload()
+        preparedAudio = nil
         prepareToken = UUID()
         prepareState = .idle
         prepareNotices = []
         preparedKey = ""
-    }
-
-    /// Why the last /prepare failed (for staff, in a tooltip).
-    var prepareFailure: String? {
-        if case .failed(let reason) = prepareState { return reason }
-        return nil
     }
 
     /// The prompt_id to send instead of the audio, when the current prompt was prepared as it is now.
@@ -290,19 +291,27 @@ final class AppModel {
     }
 
     /// Play or stop the recording (or the sample voice).
+    /// Play or stop the prepared prompt: the processed audio the model uses, not the raw
+    /// recording; nothing to play until /prepare has returned it.
     func togglePromptPlayback() {
         if promptPlayer.isPlaying {
             promptPlayer.stop()
             return
         }
-        guard let url = promptURL else { return }
+        guard canPlayPrompt, let audio = preparedAudio else { return }
         do {
-            try promptPlayer.load(url: url)
+            try promptPlayer.load(data: audio)
             player.stop()
             promptPlayer.play()
         } catch {
             alert = AlertItem(title: "Cannot play the recording", message: error.localizedDescription)
         }
+    }
+
+    /// The processed prompt has arrived and can be played.
+    var canPlayPrompt: Bool {
+        guard case .ready = prepareState, preparedKey == promptKey else { return false }
+        return preparedAudio != nil
     }
 
     // -----------------------------
@@ -325,8 +334,10 @@ final class AppModel {
         }
         noMicrophone = false
         let settings = config.recording
+        // When the server trims the prompt (after enhancing it), keep the whole recording: the
+        // enhancement estimates the noise from the edges without speech.
         recorder.start(device: device, countdown: settings.countdownSeconds, maxSeconds: settings.maxSeconds,
-                       sampleRate: settings.sampleRate, trimSilence: settings.trimSilence)
+                       sampleRate: settings.sampleRate, trimSilence: settings.trimSilence && !config.processing.trimPrompt)
     }
 
     /// The chosen microphone, or the system default input when none is chosen or the chosen one
@@ -962,7 +973,9 @@ final class AppModel {
         let limits = config.warnings
         let mine = selection == .recording
         var notices: [Notice] = []
-        let seconds = String(format: "%.1f", info.duration)
+        // For a recording, the length of the speech in it (it may keep silent edges)
+        let speech = mine ? (recorder.take?.speechDuration ?? info.duration) : info.duration
+        let seconds = String(format: "%.1f", speech)
         if info.sampleRate < 16000 {
             notices.append(Notice(level: .error, code: "prompt_low_sample_rate", message:
                 "The audio quality is too low (\(Int(info.sampleRate)) Hz; at least 16000 Hz is needed)."))
@@ -970,7 +983,7 @@ final class AppModel {
             notices.append(Notice(level: .warning, code: "prompt_low_sample_rate", message:
                 "The audio quality is low (\(Int(info.sampleRate)) Hz); the voice may sound muffled."))
         }
-        if info.duration < limits.minPromptSeconds {
+        if speech < limits.minPromptSeconds {
             notices.append(Notice(level: .warning, code: "prompt_short", message: mine
                 ? "Your recording is only \(seconds) s. Record again and read the whole sentence."
                 : "This sample voice is only \(seconds) s long; the result may sound less like it."))

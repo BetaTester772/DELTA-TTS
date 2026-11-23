@@ -415,11 +415,19 @@ struct PrepareStatus: View {
             Label("Ready", systemImage: "checkmark.circle.fill")
                 .foregroundStyle(Theme.accent)
                 .fontWeight(.medium)
-        case .failed:
-            // Generate still works: it sends the recording again.
-            Text("Will be prepared when you generate")
-                .foregroundStyle(Theme.tertiaryText)
-                .help(model.prepareFailure ?? "")
+        case .failed(let reason):
+            HStack(alignment: .firstTextBaseline, spacing: 10 * scale) {
+                Label("Could not prepare your voice: \(reason)", systemImage: "exclamationmark.triangle")
+                    .foregroundStyle(Theme.error)
+                    .fixedSize(horizontal: false, vertical: true)
+                if model.selection == .recording {
+                    Button("Record again", action: model.startRecording)
+                        .buttonStyle(.borderless)
+                        .foregroundStyle(Theme.accent)
+                        .fontWeight(.semibold)
+                        .disabled(!model.canRecord)
+                }
+            }
         }
     }
 }
@@ -721,10 +729,20 @@ struct ActionBar: View {
     @ViewBuilder private var trailing: some View {
         if canChangeRecording, model.promptURL != nil {
             if !model.outputIsCurrent {
-                let playing = model.promptPlayer.isPlaying
-                SecondaryButton(title: playing ? "Stop" : (model.selection == .recording ? "Play my recording" : "Play sample"),
-                                systemImage: playing ? "stop.fill" : "play.fill",
-                                help: "Listen to the recording", action: model.togglePromptPlayback)
+                switch model.prepareState {
+                case .preparing:
+                    SecondaryButton(title: "Preparing...", systemImage: "play.fill", help: "Your voice is being prepared",
+                                    busy: true) {}
+                        .disabled(true)
+                case .ready where model.canPlayPrompt:
+                    let playing = model.promptPlayer.isPlaying
+                    SecondaryButton(title: playing ? "Stop" : (model.selection == .recording ? "Play my recording" : "Play sample"),
+                                    systemImage: playing ? "stop.fill" : "play.fill",
+                                    help: "Listen to your voice as the model hears it (cleaned and trimmed)",
+                                    action: model.togglePromptPlayback)
+                default:
+                    EmptyView()  // nothing processed to play (a failure is shown in step 1)
+                }
             }
             if !textFocused.wrappedValue {
                 SecondaryButton(title: "Edit text", systemImage: "pencil", help: "Change what your voice says") {
@@ -815,12 +833,21 @@ struct SecondaryButton: View {
     var title: String
     var systemImage: String
     var help: String
+    var busy = false  // a small spinner instead of the icon
     var action: () -> Void
 
     var body: some View {
         Button(action: action) {
-            Label(title, systemImage: systemImage)
-                .scaledFont(TypeSize.body, weight: .medium)
+            Label {
+                Text(title)
+            } icon: {
+                if busy {
+                    ProgressView().controlSize(.small)
+                } else {
+                    Image(systemName: systemImage)
+                }
+            }
+            .scaledFont(TypeSize.body, weight: .medium)
                 .frame(minHeight: 32 * scale)
                 .padding(.horizontal, 4 * scale)
                 .padding(.vertical, 2 * scale)

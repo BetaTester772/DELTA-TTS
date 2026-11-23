@@ -88,12 +88,14 @@ struct PrepareRequest: Encodable, Sendable {
 struct PrepareResponse: Decodable, Sendable {
     var promptId: String
     var durationSeconds: Double
+    var audioWavBase64: String?  // the processed prompt: what the model uses
     var warnings: [Notice]
 
     enum CodingKeys: String, CodingKey {
         case warnings
         case promptId = "prompt_id"
         case durationSeconds = "duration_s"
+        case audioWavBase64 = "audio_wav_base64"
     }
 }
 
