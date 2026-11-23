@@ -93,7 +93,8 @@ class DeltaTTSPipeline:
             _move_decoder_to_mps(self.cosyvoice.model, self.device)
 
     @torch.no_grad()
-    def synthesize(self, text: str, prompt_wav: str, prompt_text: str, speech_len: int | None = None, **decoding) -> torch.Tensor:
+    def synthesize(self, text: str, prompt_wav: str, prompt_text: str, speech_len: int | None = None,
+                   length_scale: float = 1.0, **decoding) -> torch.Tensor:
         """Synthesize `text` in the voice of `prompt_wav`.
 
         Args:
@@ -102,6 +103,8 @@ class DeltaTTSPipeline:
             prompt_text: Transcript of the prompt audio.
             speech_len: Output length in speech tokens (25 per second). Estimated from the
                 prompt when None.
+            length_scale: Factor on the estimated length (above 1: slower speech). Ignored when
+                `speech_len` is given.
             **decoding: Overrides for `delta_tts.generate.generate` (num_steps, top_p, ...).
         Returns:
             Waveform at `self.sample_rate`. Shape: (1, num_samples)
@@ -126,6 +129,7 @@ class DeltaTTSPipeline:
         if speech_len is None:
             # The length rule uses the untrimmed prompt token count (see `_extract_prompt`).
             speech_len = estimate_speech_len(prompt_text, text, prompt["untrimmed_speech_len"])
+            speech_len = max(1, round(speech_len * length_scale))
 
         # -----------------------------
         # 3. DELTA-TTS: speech tokens by iterative unmasking

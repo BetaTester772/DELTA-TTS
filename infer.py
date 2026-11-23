@@ -36,6 +36,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--shard", default="0/1", help="i/N: process every N-th line starting at i (one shard per GPU)")
     # decoding
     parser.add_argument("--num_steps", type=int, default=16)
+    parser.add_argument("--length_scale", type=float, default=1.0, help="factor on the estimated output length")
     parser.add_argument("--temperature", type=float, default=0.0, help="0 takes the most likely token; above 0 samples")
     parser.add_argument("--device", default=None, help="cuda, mps or cpu; by default CUDA, then MPS, then CPU")
     parser.add_argument("--compute", choices=["exact", "fast"], default="exact",
@@ -71,7 +72,7 @@ def main() -> None:
     if args.meta is None:
         if not (args.prompt_wav and args.prompt_text and args.text):
             raise SystemExit("Give --prompt_wav, --prompt_text and --text, or --meta.")
-        wav = tts.synthesize(args.text, args.prompt_wav, args.prompt_text, **decoding)
+        wav = tts.synthesize(args.text, args.prompt_wav, args.prompt_text, length_scale=args.length_scale, **decoding)
         torchaudio.save(args.output, wav, tts.sample_rate)
         logger.info("Saved %s", args.output)
         return
@@ -90,7 +91,7 @@ def main() -> None:
         out_path = out_dir / f"{utt_id}.wav"
         if out_path.exists():
             continue
-        wav = tts.synthesize(target_text, str(meta.parent / prompt_wav), prompt_text, **decoding)
+        wav = tts.synthesize(target_text, str(meta.parent / prompt_wav), prompt_text, length_scale=args.length_scale, **decoding)
         torchaudio.save(str(out_path), wav, tts.sample_rate)
     logger.info("Wrote %d utterances to %s", len(rows), out_dir)
 

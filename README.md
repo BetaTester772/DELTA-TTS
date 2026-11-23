@@ -74,6 +74,8 @@ The output length is estimated with the length rule of [OmniVoice](https://githu
 
 `--compute exact` (default) runs DELTA-TTS in float32. `--compute fast` runs it in float16; a step whose float16 logits overflow (inf/NaN) is recomputed in float32 and the rest of that utterance stays in float32. Fast-mode outputs differ numerically from exact ones.
 
+`--length_scale` multiplies the estimated length (above 1: slower speech).
+
 With the `audio` extra, the prompt can be cleaned before synthesis and the output trimmed after it (all off by default; the paper results use none):
 
 | Flag | Effect |
