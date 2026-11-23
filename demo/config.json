@@ -7,7 +7,8 @@
     "reuse_dir": "nvidia/NVIDIA-NemotronLabs-RE-USE",
     "device": null,
     "compute": "exact",
-    "allowed_origins": []
+    "allowed_origins": [],
+    "prewarm_fast": true
   },
   "presets": [
     {
@@ -77,7 +78,7 @@
     "venue": "NeurIPS 2026",
     "default_transcript": "To be, or not to be, that is the question",
     "default_text": "Hello, this is your voice.",
-    "fast_speedup_percent": null
+    "fast_speedup_percent": 20
   },
   "recording": {
     "max_seconds": 12,

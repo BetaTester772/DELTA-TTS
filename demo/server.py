@@ -6,7 +6,8 @@ Run from the repository root:
 
 Endpoints (JSON)
     GET  /health       status ("loading", "ready" or "error"), device, compute, sample_rate, dry_run, the
-                       generation backend's readiness (e.g. the fast mode warming up), if known, and
+                       readiness of the current generation backend and of the fast one (warming up
+                       in the background from the start, see server.prewarm_fast), if known, and
                        per-mode generation timings measured on this machine
     GET  /config       the config, with preset paths resolved
     POST /synthesize   text and prompt in; base64 WAV, timing and warnings out
@@ -605,8 +606,9 @@ BACKEND_KEYS = ("backend", "state", "ready_buckets", "total_buckets", "max_ready
 
 
 class DryRunBackend:
-    """The dry run's stand-in for `DeltaTTSPipeline.backend_status()`: after the first switch to
-    the fast mode, the Neural Engine buckets load one after another over `WARMUP_SECONDS`, each
+    """The dry run's stand-in for `DeltaTTSPipeline.backend_status()`: once the fast backend is
+    built (prewarmed at start, or on the first switch to the fast mode), the Neural Engine buckets
+    load one after another over `WARMUP_SECONDS`, each
     "loading" and then, after `COMPILING_AFTER` seconds, "compiling", as `CoreMLForward.status()`
     reports them (or every bucket fails after a few seconds with --dry-run-fast-fails), so that
     the app's warm-up display can be tested."""
@@ -620,7 +622,12 @@ class DryRunBackend:
         self._started: float | None = None
 
     def switched(self, compute: str) -> None:
-        if compute == "fast" and self._started is None:
+        if compute == "fast":
+            self.prewarm()
+
+    def prewarm(self) -> None:
+        """Build the fast backend: its buckets start loading (`DeltaTTSPipeline.prewarm_fast`)."""
+        if self._started is None:
             self._started = time.monotonic()
 
     def status(self, compute: str) -> dict[str, Any]:
@@ -628,8 +635,7 @@ class DryRunBackend:
             return {"backend": "float32", "state": "ready"}
         total = len(self.BUCKETS)
         if self._started is None:
-            return {"backend": "neural_engine", "state": "idle", "ready_buckets": 0, "total_buckets": total,
-                    "max_ready_len": None, "failed_buckets": [], "loading_bucket": None}
+            return {"backend": None, "state": "not_started"}
         elapsed = time.monotonic() - self._started
         if self.fails and elapsed > 5:
             return {"backend": "neural_engine", "state": "failed", "ready_buckets": 0, "total_buckets": total,
@@ -790,6 +796,8 @@ class TTSService:
                 time.sleep(DRY_RUN_LOAD_SECONDS)
             else:
                 self._load_model()
+            if self.config["server"].get("prewarm_fast", True):
+                self._prewarm_fast()
         except Exception as e:  # reported through /health
             logger.exception("Loading the model failed")
             self.error = f"{type(e).__name__}: {e}"
@@ -822,6 +830,7 @@ class TTSService:
             "dry_run": self.dry_run,
             "busy": self._lock.locked(),
             "backend": self.backend_status(),
+            "fast_backend": self.backend_status("fast"),
             "timing": self.timing_summary(),
         }
 
@@ -842,17 +851,34 @@ class TTSService:
         status = self.backend_status()
         return status is None or status.get("state") in (None, "ready")
 
-    def backend_status(self) -> dict[str, Any] | None:
-        """The generation backend's readiness from `DeltaTTSPipeline.backend_status()` (e.g. the
-        fast mode's Neural Engine functions compiling in the background), read defensively: None
-        when the pipeline has no such method, it fails, or the model is not loaded."""
+    def _prewarm_fast(self) -> None:
+        """Build the fast backend without switching to it, so that its Neural Engine buckets load
+        in the background from the start (`DeltaTTSPipeline.prewarm_fast`); a later switch to the
+        fast mode finds them loaded."""
         if self.dry_run:
-            return self._dry_backend.status(self.compute)
+            self._dry_backend.prewarm()
+            return
+        method = getattr(self.tts, "prewarm_fast", None)
+        if not callable(method):
+            return
+        try:
+            method()
+            logger.info("Warming up the fast backend in the background")
+        except Exception:  # the exact mode works without it
+            logger.warning("Could not prewarm the fast backend", exc_info=True)
+
+    def backend_status(self, mode: str | None = None) -> dict[str, Any] | None:
+        """The readiness of the generation backend of `mode` (default: the current mode) from
+        `DeltaTTSPipeline.backend_status()` (e.g. the fast mode's Neural Engine functions
+        compiling in the background), read defensively: None when the pipeline has no such
+        method (or no `mode` argument), it fails, or the model is not loaded."""
+        if self.dry_run:
+            return self._dry_backend.status(mode or self.compute)
         method = getattr(self.tts, "backend_status", None)
         if not callable(method):
             return None
         try:
-            status = method()
+            status = method(mode) if mode else method()
             if not isinstance(status, dict):
                 return None
             report = {key: status.get(key) for key in BACKEND_KEYS if key in status}
