@@ -9,7 +9,8 @@ Endpoints (JSON)
     GET  /config       the config, with preset paths resolved
     POST /synthesize   text and prompt in; base64 WAV, timing and warnings out
     POST /prepare      prompt in; processes it (VAD trim, enhancement) and caches its features, so that
-                       a later /synthesize with the returned prompt_id does no prompt processing
+                       a later /synthesize with the returned prompt_id does no prompt processing;
+                       returns the processed prompt audio (what the model uses)
     POST /reset        forget the previous visitor: uploaded and prepared prompts, cached prompt features
     GET  /progress     progress of the /synthesize or /prepare in flight: state, stage, step, fraction
 
@@ -306,6 +307,13 @@ def estimate_output_seconds(text: str, prompt_text: str, prompt_seconds: float |
         prompt_len = round(prompt_seconds * SPEECH_TOKEN_RATE)
     speech_len = duration_rule.estimate_speech_len(prompt_text, text, prompt_len)
     return max(1, round(speech_len * length_scale)) / SPEECH_TOKEN_RATE
+
+
+def pcm16(wav: Any) -> bytes:
+    """A float waveform tensor (1, num_samples) as little-endian 16-bit PCM."""
+    import torch
+
+    return wav[0].clamp(-1, 1).mul(32767).round().to(torch.int16).cpu().numpy().astype("<i2").tobytes()
 
 
 def wav_bytes(pcm16: bytes, sample_rate: int) -> bytes:
@@ -634,6 +642,11 @@ class Progress:
             fraction = min(1.0, done / sum(weights))
             self._fraction = fraction if self._fraction is None else max(self._fraction, fraction)
 
+    def mark(self, stage: str) -> None:
+        """`stage` runs without step reports (the fraction stays as it is, None if unknown)."""
+        with self._lock:
+            self._stage = stage
+
     def end(self, success: bool) -> None:
         """The request finished. On success, the observed stage durations refine the weights."""
         with self._lock:
@@ -765,14 +778,12 @@ class TTSService:
             forgotten = self.prepared.clear()
             self._dry_cache.clear()
             self.progress.clear()
-            cleared = 0
             if self.tts is not None:
-                cleared = len(self.tts._prompt_cache)
-                self.tts._prompt_cache.clear()
-        logger.info("Reset: removed %d uploaded prompts, forgot %d prepared prompts, cleared %d cached prompt features",
-                    removed, forgotten, cleared)
+                self.tts.clear_prompt_cache()
+        logger.info("Reset: removed %d uploaded prompts, forgot %d prepared prompts, cleared the prompt cache",
+                    removed, forgotten)
         return {"status": "ok", "removed_uploads": removed, "forgotten_prompts": forgotten,
-                "cleared_prompt_features": cleared}
+                "cleared_prompt_cache": True}
 
     def _arrive(self, body: dict[str, Any]) -> int:
         """Note the reset epoch of a request as it arrives, before anything is validated or stored.
@@ -793,9 +804,7 @@ class TTSService:
             self.prepared.forget(stored)
             self._dry_cache.discard(stored)
             if self.tts is not None:
-                path = os.path.abspath(stored)
-                for key in [k for k in self.tts._prompt_cache if k[0] == path]:
-                    del self.tts._prompt_cache[key]
+                self.tts.clear_prompt_cache()  # a reset ran: nothing cached may stay
         raise RequestError(HTTPStatus.CONFLICT, "reset_in_progress", "Reset in progress; please try again.")
 
     def _check_ready(self) -> None:
@@ -822,15 +831,19 @@ class TTSService:
                 check_transcript(prompt.prompt_text, notices)
                 check_processing(prompt.processing)
                 seconds = check_prompt_audio(prompt, notices)
+                self.progress.mark("prompt")  # no step reports from prepare_prompt: indeterminate
                 if self.dry_run:
                     time.sleep(DRY_RUN_PREPARE_SECONDS)
                     processed = seconds  # no trimming in the dry run
+                    wav_file = prompt.prompt_wav.read_bytes()  # stands in for the processed audio
                     self._dry_set_processing(prompt.processing)
                     self._dry_cache.add(prompt.prompt_wav)
                     notices.append(notice("info", "dry_run_prepare",
-                                          "Dry run: the prompt is registered, but not trimmed or enhanced."))
+                                          "Dry run: the prompt is registered, and returned as it is (not trimmed or enhanced)."))
                 else:
-                    processed = self._prepare_model(prompt, notices)
+                    pcm, sample_rate = self._prepare_model(prompt, notices)
+                    processed = len(pcm) / 2 / sample_rate
+                    wav_file = wav_bytes(pcm, sample_rate)
                 self._check_epoch(epoch, stored=prompt.prompt_wav)
                 prompt_id = self.prepared.register(prompt.prompt_wav)
                 success = True
@@ -841,11 +854,16 @@ class TTSService:
             notices.append(notice("warning", "prompt_short",
                                   f"After removing silence, the recording is {processed:.1f} s long "
                                   f"(under {limits['min_prompt_seconds']:g} s); record again and read the whole sentence."))
-        return {"prompt_id": prompt_id, "duration_s": round(processed, 3), "dry_run": self.dry_run,
+        return {"prompt_id": prompt_id, "duration_s": round(processed, 3),
+                "audio_wav_base64": base64.b64encode(wav_file).decode("ascii"), "dry_run": self.dry_run,
                 "warnings": notices}
 
-    def _prepare_model(self, prompt: PromptSpec, notices: list[Notice]) -> float:
-        """Process the prompt into the prompt cache. Returns its duration after processing, in seconds."""
+    def _prepare_model(self, prompt: PromptSpec, notices: list[Notice]) -> tuple[bytes, int]:
+        """Process the prompt into the pipeline's prompt cache (`DeltaTTSPipeline.prepare_prompt`).
+
+        Returns:
+            The processed prompt audio, which the model uses, as 16-bit PCM, and its sample rate.
+        """
         import torch
 
         logs = LogCollector()
@@ -853,16 +871,10 @@ class TTSService:
             with logs:
                 self._set_processing(prompt.processing)
                 with torch.no_grad():
-                    features = self._warm_prompt_cache(prompt.prompt_wav, prompt.prompt_text)
+                    wav, sample_rate = self.tts.prepare_prompt(str(prompt.prompt_wav), prompt.prompt_text)
         finally:
             self._library_notices(logs.records, notices)
-        return features["untrimmed_speech_len"] / SPEECH_TOKEN_RATE
-
-    def _warm_prompt_cache(self, prompt_wav: Path, prompt_text: str) -> dict[str, Any]:
-        """Run the prompt half of `DeltaTTSPipeline.synthesize` (processing, speech tokens, mel,
-        speaker embedding) and keep the result in the pipeline's prompt cache. This warms the cache
-        through the private `_prompt`; a public pipeline method will replace this call."""
-        return self.tts._prompt(str(prompt_wav), prompt_text)
+        return pcm16(wav), int(sample_rate)
 
     @staticmethod
     def _library_notices(records: list[logging.LogRecord], notices: list[Notice],
@@ -941,8 +953,6 @@ class TTSService:
         self.processing = processing
 
     def _synthesize_model(self, request: SynthesisRequest, notices: list[Notice]) -> tuple[bytes, float, bool]:
-        import torch
-
         logs = LogCollector()
         try:
             with logs:
@@ -960,8 +970,7 @@ class TTSService:
             notices.append(notice("warning", "fast_fallback",
                                   "float16 overflowed in this utterance, so it was finished in float32; "
                                   "the output is valid but synthesis was slower."))
-        pcm = wav[0].clamp(-1, 1).mul(32767).round().to(torch.int16).numpy().astype("<i2").tobytes()
-        return pcm, elapsed, fell_back
+        return pcm16(wav), elapsed, fell_back
 
     def _set_compute(self, compute: str) -> None:
         """Switch between float32 (exact) and float16 with fallback (fast)."""
@@ -1001,7 +1010,7 @@ class TTSService:
             self.tts.audio_processor = None
         if processing[:2] != self.processing[:2]:
             # Cached prompt features were computed with the previous prompt processing.
-            self.tts._prompt_cache.clear()
+            self.tts.clear_prompt_cache()
         self.processing = processing
 
 
