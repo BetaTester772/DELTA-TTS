@@ -5,7 +5,9 @@ Run from the repository root:
     uv run python demo/server.py [--config demo/config.json] [--dry-run]
 
 Endpoints (JSON)
-    GET  /health       status ("loading", "ready" or "error"), device, compute, sample_rate, dry_run
+    GET  /health       status ("loading", "ready" or "error"), device, compute, sample_rate, dry_run, the
+                       generation backend's readiness (e.g. the fast mode warming up), if known, and
+                       per-mode generation timings measured on this machine
     GET  /config       the config, with preset paths resolved
     POST /synthesize   text and prompt in; base64 WAV, timing and warnings out
     POST /prepare      prompt in; processes it (VAD trim, enhancement) and caches its features, so that
@@ -13,6 +15,8 @@ Endpoints (JSON)
                        returns the processed prompt audio (what the model uses)
     POST /reset        forget the previous visitor: uploaded and prepared prompts, cached prompt features
     GET  /progress     progress of the /synthesize or /prepare in flight: state, stage, step, fraction
+    POST /compute      switch the compute mode now ("exact" or "fast"), e.g. to start warming up the
+                       fast backend before the next request
 
 Every notice in "warnings" is {level: "info" | "warning" | "error", code, message}. A request
 that cannot be served gets an HTTP 4xx/5xx status and {error, code, warnings}.
@@ -45,12 +49,13 @@ import os
 import shutil
 import signal
 import stat
+import statistics
 import sys
 import tempfile
 import threading
 import time
 import wave
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from collections.abc import Callable
 from dataclasses import dataclass
 from http import HTTPStatus
@@ -94,6 +99,8 @@ STAGES = ("prompt", "tokens", "acoustic", "vocoder")
 # which runs only when the prompt is not cached. Refined per compute mode by `STAGE_EMA`.
 STAGE_SECONDS = {"prompt": 0.5, "tokens": 0.49, "acoustic": 0.47, "vocoder": 0.04}
 STAGE_EMA = 0.3  # weight of the latest observed durations
+TIMING_WINDOW = 20  # generations per compute mode kept for /health's timing summary
+DRY_RUN_FAST_FACTOR = {"ready": 0.6, "warming": 1.1}  # dry run: step time of the fast mode vs exact
 
 logger = logging.getLogger("demo.server")
 
@@ -593,6 +600,53 @@ def check_request(request: SynthesisRequest, notices: list[Notice]) -> float:
     return estimate
 
 
+BACKEND_KEYS = ("backend", "state", "ready_buckets", "total_buckets", "max_ready_len", "failed_buckets",
+                "loading_bucket", "error")
+
+
+class DryRunBackend:
+    """The dry run's stand-in for `DeltaTTSPipeline.backend_status()`: after the first switch to
+    the fast mode, the Neural Engine buckets load one after another over `WARMUP_SECONDS`, each
+    "loading" and then, after `COMPILING_AFTER` seconds, "compiling", as `CoreMLForward.status()`
+    reports them (or every bucket fails after a few seconds with --dry-run-fast-fails), so that
+    the app's warm-up display can be tested."""
+
+    BUCKETS = (160, 192, 256, 320, 384, 512, 640)  # sequence lengths, as the exported model
+    WARMUP_SECONDS = 21.0
+    COMPILING_AFTER = 2.0
+
+    def __init__(self, fails: bool) -> None:
+        self.fails = fails
+        self._started: float | None = None
+
+    def switched(self, compute: str) -> None:
+        if compute == "fast" and self._started is None:
+            self._started = time.monotonic()
+
+    def status(self, compute: str) -> dict[str, Any]:
+        if compute != "fast":
+            return {"backend": "float32", "state": "ready"}
+        total = len(self.BUCKETS)
+        if self._started is None:
+            return {"backend": "neural_engine", "state": "idle", "ready_buckets": 0, "total_buckets": total,
+                    "max_ready_len": None, "failed_buckets": [], "loading_bucket": None}
+        elapsed = time.monotonic() - self._started
+        if self.fails and elapsed > 5:
+            return {"backend": "neural_engine", "state": "failed", "ready_buckets": 0, "total_buckets": total,
+                    "max_ready_len": None, "failed_buckets": list(self.BUCKETS), "loading_bucket": None,
+                    "error": "The Neural Engine could not load the model (simulated)."}
+        per_bucket = self.WARMUP_SECONDS / total
+        ready = min(total, int(elapsed / per_bucket))
+        if ready == total:
+            return {"backend": "neural_engine", "state": "ready", "ready_buckets": total, "total_buckets": total,
+                    "max_ready_len": self.BUCKETS[-1], "failed_buckets": [], "loading_bucket": None}
+        loading_for = elapsed - ready * per_bucket
+        return {"backend": "neural_engine", "state": "compiling" if loading_for > self.COMPILING_AFTER else "loading",
+                "ready_buckets": ready, "total_buckets": total,
+                "max_ready_len": self.BUCKETS[ready - 1] if ready else None, "failed_buckets": [],
+                "loading_bucket": self.BUCKETS[ready]}
+
+
 class Progress:
     """Progress of the request in flight, for GET /progress; thread-safe (it is updated from the
     request's thread and read from others).
@@ -647,9 +701,17 @@ class Progress:
         with self._lock:
             self._stage = stage
 
-    def end(self, success: bool) -> None:
-        """The request finished. On success, the observed stage durations refine the weights."""
+    def end(self, success: bool) -> float | None:
+        """The request finished. On success, the observed stage durations refine the weights.
+
+        Returns:
+            The duration of the generation stages (tokens, acoustic, vocoder) in seconds, without
+            the prompt stage; None if the request failed or reported no token steps.
+        """
+        generation: float | None = None
         with self._lock:
+            if success and "tokens" in self._started:
+                generation = time.monotonic() - self._started["tokens"]
             if success and len(self._started) == len(self._plan) > 0:
                 now = time.monotonic()
                 starts = [self._started[s] for s in self._plan] + [now]
@@ -661,6 +723,7 @@ class Progress:
                         observed = (end - begin) / elapsed * scale
                         seconds[stage] = (1 - STAGE_EMA) * seconds[stage] + STAGE_EMA * observed
             self._reset("idle", self._mode)
+        return generation
 
     def clear(self) -> None:
         """Forget the last request's state (on /reset); the learned stage weights stay."""
@@ -685,9 +748,13 @@ class TTSService:
         dry_run: Serve a synthetic tone instead of loading DELTA-TTS.
     """
 
-    def __init__(self, config: dict[str, Any], dry_run: bool) -> None:
+    def __init__(self, config: dict[str, Any], dry_run: bool, dry_run_fast_fails: bool = False) -> None:
         self.config = config
         self.dry_run = dry_run
+        self._dry_backend = DryRunBackend(fails=dry_run_fast_fails)
+        # Per compute mode: (generation seconds, output seconds) of the last clean generations
+        # (no float32 fallback, backend ready throughout), for an honest exact-vs-fast comparison.
+        self._timings: dict[str, deque[tuple[float, float]]] = {mode: deque(maxlen=TIMING_WINDOW) for mode in COMPUTE_MODES}
         self.status = "loading"  # "loading", "ready" or "error"
         self.error: str | None = None
         self.device: str | None = None
@@ -695,7 +762,6 @@ class TTSService:
         self.processing: tuple[bool, bool, bool] = (False, False, False)
         self.sample_rate = DRY_RUN_SAMPLE_RATE
         self.tts: Any = None  # DeltaTTSPipeline
-        self._fast_forward: Any = None  # ReducedPrecisionForward, created on first use
         self._processors: dict[tuple[bool, bool, bool], Any] = {}  # AudioProcessor per setting
         self._lock = threading.Lock()  # one synthesis or prompt preparation at a time
         self.uploads = UploadStore()
@@ -744,8 +810,6 @@ class TTSService:
         self.sample_rate = self.tts.sample_rate
         self._has_progress = "progress" in inspect.signature(self.tts.synthesize).parameters
         logger.info("Per-step progress from the pipeline: %s", "yes" if self._has_progress else "no (indeterminate)")
-        if self.compute == "fast":
-            self._fast_forward = self.tts.forward
 
     def health(self) -> dict[str, Any]:
         return {
@@ -757,7 +821,62 @@ class TTSService:
             "sample_rate": self.sample_rate,
             "dry_run": self.dry_run,
             "busy": self._lock.locked(),
+            "backend": self.backend_status(),
+            "timing": self.timing_summary(),
         }
+
+    def timing_summary(self) -> dict[str, dict[str, Any]]:
+        """Per compute mode: the median duration of the generation stages (`generation_s`), the
+        median of that per second of output (`generation_per_output_s`, comparable across texts)
+        and how many generations they are from (`n`)."""
+        summary = {}
+        for mode, records in self._timings.items():
+            if records:
+                summary[mode] = {"generation_s": round(statistics.median(g for g, _ in records), 4),
+                                 "generation_per_output_s": round(statistics.median(g / o for g, o in records), 4),
+                                 "n": len(records)}
+        return summary
+
+    def _backend_ready(self) -> bool:
+        """The backend is not warming up (unknown counts as ready)."""
+        status = self.backend_status()
+        return status is None or status.get("state") in (None, "ready")
+
+    def backend_status(self) -> dict[str, Any] | None:
+        """The generation backend's readiness from `DeltaTTSPipeline.backend_status()` (e.g. the
+        fast mode's Neural Engine functions compiling in the background), read defensively: None
+        when the pipeline has no such method, it fails, or the model is not loaded."""
+        if self.dry_run:
+            return self._dry_backend.status(self.compute)
+        method = getattr(self.tts, "backend_status", None)
+        if not callable(method):
+            return None
+        try:
+            status = method()
+            if not isinstance(status, dict):
+                return None
+            report = {key: status.get(key) for key in BACKEND_KEYS if key in status}
+            json.dumps(report)  # only what the response can carry
+        except Exception:  # the display is optional; never fail /health over it
+            logger.debug("backend_status() failed", exc_info=True)
+            return None
+        return report
+
+    def switch_compute(self, body: dict[str, Any]) -> dict[str, Any]:
+        """Serve POST /compute: switch the compute mode now (waiting for a running request), so
+        that the fast backend starts warming up before the next synthesis."""
+        self._check_ready()
+        compute = body.get("compute")
+        if compute not in COMPUTE_MODES:
+            raise bad_request("invalid_parameter", f"compute must be 'exact' or 'fast', got {compute!r}")
+        with self._lock:
+            if self.dry_run:
+                self.compute = compute
+                self._dry_backend.switched(compute)
+            else:
+                self._set_compute(compute)
+        logger.info("Compute mode: %s", compute)
+        return self.health()
 
     def public_config(self) -> dict[str, Any]:
         """The config with each preset's resolved `wav_path` and whether it exists."""
@@ -901,6 +1020,8 @@ class TTSService:
             estimate = check_request(request, notices)
             self.progress.begin("generating", request.compute)
             success = False
+            warm = self._backend_ready()
+            generation: float | None = None
             try:
                 if self.dry_run:
                     pcm, elapsed, fell_back = self._synthesize_dry_run(request, estimate, notices)
@@ -909,8 +1030,11 @@ class TTSService:
                 self._check_epoch(epoch, stored=request.prompt_wav)
                 success = True
             finally:
-                self.progress.end(success)
-        duration = len(pcm) / 2 / self.sample_rate
+                generation = self.progress.end(success)
+            duration = len(pcm) / 2 / self.sample_rate
+            # Only clean generations count: no float32 fallback, backend ready before and after.
+            if generation is not None and duration > 0 and not fell_back and warm and self._backend_ready():
+                self._timings[request.compute].append((generation, duration))
         return {
             "audio_wav_base64": base64.b64encode(wav_bytes(pcm, self.sample_rate)).decode("ascii"),
             "sample_rate": self.sample_rate,
@@ -929,6 +1053,10 @@ class TTSService:
         start = time.perf_counter()
         self._dry_set_processing(request.processing)
         self.compute = request.compute
+        self._dry_backend.switched(request.compute)
+        factor = 1.0
+        if request.compute == "fast":
+            factor = DRY_RUN_FAST_FACTOR["ready" if self._backend_ready() else "warming"]
         for stage, (steps, step_seconds) in DRY_RUN_STAGES.items():
             if stage == "prompt" and request.prompt_wav in self._dry_cache:
                 continue  # cached, as after /prepare
@@ -936,7 +1064,7 @@ class TTSService:
                 steps = request.decoding["num_steps"]
             self.progress.update(stage, 0, steps)
             for step in range(1, steps + 1):
-                time.sleep(step_seconds)
+                time.sleep(step_seconds * (factor if stage != "prompt" else 1.0))
                 self.progress.update(stage, step, steps)
         self._dry_cache.add(request.prompt_wav)
         pcm = dry_run_tone(estimate, self.sample_rate)
@@ -952,42 +1080,45 @@ class TTSService:
             self._dry_cache.clear()
         self.processing = processing
 
+    def _float32_steps(self) -> int:
+        """Forward passes the fast backend has served in float32 so far (`FallbackForward.num_steps`)."""
+        steps = getattr(self.tts.forward, "num_steps", None)
+        try:
+            return int(steps.get("float32", 0)) if isinstance(steps, dict) else 0
+        except (TypeError, ValueError):
+            return 0
+
     def _synthesize_model(self, request: SynthesisRequest, notices: list[Notice]) -> tuple[bytes, float, bool]:
+        """Returns: the output as 16-bit PCM, the synthesis time, and whether any step of it ran in
+        float32 in the fast mode (an overflow, or a Neural Engine bucket that is not loaded yet)."""
         logs = LogCollector()
         try:
             with logs:
                 self._set_compute(request.compute)
                 self._set_processing(request.processing)
+                float32_before = self._float32_steps()
                 start = time.perf_counter()
                 extra = {"progress": self.progress.update} if self._has_progress else {}
                 wav = self.tts.synthesize(request.text, str(request.prompt_wav), request.prompt_text,
                                           length_scale=request.length_scale, **request.decoding, **extra)  # (1, num_samples)
                 elapsed = time.perf_counter() - start
         finally:  # the library's warnings are reported also when synthesis fails
-            fell_back = bool(getattr(self.tts.forward, "in_fallback", False))
-            self._library_notices(logs.records, notices, skip_precision=fell_back)  # the fallback is reported below
-        if fell_back:
+            overflowed = bool(getattr(self.tts.forward, "in_fallback", False))
+            self._library_notices(logs.records, notices, skip_precision=overflowed)  # the overflow is reported below
+        if overflowed:
             notices.append(notice("warning", "fast_fallback",
-                                  "float16 overflowed in this utterance, so it was finished in float32; "
+                                  "The fast mode overflowed in this utterance, so it was finished in float32; "
                                   "the output is valid but synthesis was slower."))
-        return pcm16(wav), elapsed, fell_back
+        return pcm16(wav), elapsed, overflowed or self._float32_steps() > float32_before
 
     def _set_compute(self, compute: str) -> None:
-        """Switch between float32 (exact) and float16 with fallback (fast)."""
+        """Switch the pipeline between exact (float32) and fast (the Neural Engine, else float16;
+        built once, loading in the background) with `DeltaTTSPipeline.set_compute`. Call it
+        holding the lock: it must not run during a synthesis."""
         if compute == self.compute:
             return
-        if compute == "fast":
-            if self._fast_forward is None:
-                import torch
-
-                from delta_tts.precision import ReducedPrecisionForward
-
-                logger.info("Creating the float16 copy of DELTA-TTS for the fast mode")
-                self._fast_forward = ReducedPrecisionForward(self.tts.model, torch.float16)
-            self.tts.forward = self._fast_forward
-        else:
-            self.tts.forward = self.tts.model
-        self.compute = compute
+        self.tts.set_compute(compute)
+        self.compute = self.tts.compute
 
     def _set_processing(self, processing: tuple[bool, bool, bool]) -> None:
         """Set the pipeline's audio processor (Silero VAD, RE-USE) for these flags."""
@@ -1056,6 +1187,8 @@ class Handler(BaseHTTPRequestHandler):
                 result = self.service.synthesize(self._read_json(), notices)
             elif path == "/prepare":
                 result = self.service.prepare(self._read_json(), notices)
+            elif path == "/compute":
+                result = self.service.switch_compute(self._read_json())
             elif path == "/reset":
                 self._read_json()  # same Content-Type and size checks as /synthesize; the body is ignored
                 result = self.service.reset()
@@ -1066,7 +1199,8 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:
             logger.exception("%s failed", path)
             code, what = {"/synthesize": ("synthesis_failed", "Synthesis"),
-                          "/prepare": ("prepare_failed", "Preparing the prompt")}.get(path, ("reset_failed", "Reset"))
+                          "/prepare": ("prepare_failed", "Preparing the prompt"),
+                          "/compute": ("compute_failed", "Switching the compute mode")}.get(path, ("reset_failed", "Reset"))
             error = RequestError(HTTPStatus.INTERNAL_SERVER_ERROR, code, f"{what} failed: {type(e).__name__}: {e}")
             self._send_error(error, notices)
         else:
@@ -1143,6 +1277,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--config", default=str(DEFAULT_CONFIG), help="demo config (default: demo/config.json)")
     parser.add_argument("--dry-run", action="store_true", help="load no model; synthesize a tone of the estimated length")
+    parser.add_argument("--dry-run-fast-fails", action="store_true",
+                        help="dry run: let the simulated fast-mode warm-up fail, to test the app's display")
     parser.add_argument("--host", help="overrides server.host of the config")
     parser.add_argument("--port", type=int, help="overrides server.port of the config")
     args = parser.parse_args()
@@ -1152,7 +1288,7 @@ def main() -> None:
     host, port = args.host or config["server"]["host"], args.port or config["server"]["port"]
     if host not in LOCAL_HOSTS:
         logger.warning("Listening on %s: this server is for local use only and must not be exposed to a network", host)
-    service = TTSService(config, dry_run=args.dry_run)
+    service = TTSService(config, dry_run=args.dry_run, dry_run_fast_fails=args.dry_run_fast_fails)
     Handler.service = service
     Handler.allowed_hosts = frozenset({f"127.0.0.1:{port}", f"localhost:{port}", f"[::1]:{port}"})
     Handler.allowed_origins = frozenset(config["server"].get("allowed_origins") or [])

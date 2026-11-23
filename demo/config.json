@@ -76,7 +76,8 @@
     "subtitle": "Adapting Autoregressive Model into Diffusion Language Model for Text-to-Speech",
     "venue": "NeurIPS 2026",
     "default_transcript": "To be, or not to be, that is the question",
-    "default_text": "Hello, this is your voice."
+    "default_text": "Hello, this is your voice.",
+    "fast_speedup_percent": null
   },
   "recording": {
     "max_seconds": 12,
