@@ -133,21 +133,95 @@ A macOS app for a live demo (SwiftUI; macOS 26 or newer) in `demo/DeltaTTSDemo`:
 It talks to a small local server, `demo/server.py`, which keeps the model loaded.
 Both read `demo/config.json`: server settings, the header titles, the sentence to read and the default text, recording settings, sample voices (the prompts of the demo page), synthesis and processing defaults, and warning thresholds.
 
-```bash
-uv run --extra mac --extra audio python demo/server.py            # loads the model; GET /health reports "loading", then "ready"
-uv run --extra mac --extra audio python demo/server.py --dry-run  # no model: returns a tone of the estimated output length
-demo/DeltaTTSDemo/make_app.sh                                     # builds demo/DeltaTTSDemo/build/DeltaTTSDemo.app
-open demo/DeltaTTSDemo/build/DeltaTTSDemo.app
-```
+### Running the demo on another Mac
 
-The server needs both extras: without `mac`, macOS has no onnxruntime (the server cannot start) and no coremltools (no Neural Engine), and without `audio` there is no Silero VAD or RE-USE. The app's "Start local server" runs the same command.
+Requirements:
+- An Apple Silicon Mac with macOS 26 or newer.
+- Xcode 26 or newer (Swift 6.2), selected with `xcode-select`.
+- [Homebrew](https://brew.sh).
+- 16 GB of RAM.
+- About 15 GB of free disk for the models and the Python environment, plus about 6 GB for macOS's Neural Engine cache. Keep 30 GB or more free: macOS deletes that cache when the disk runs low, and the Neural Engine then has to compile again.
+
+1. Install the tools.
+
+   ```bash
+   brew install uv ffmpeg
+   ```
+
+2. Get the code on this branch, with its submodules.
+
+   ```bash
+   git clone --recursive -b macos-demo-app <repository URL> DELTA-TTS
+   cd DELTA-TTS
+   ```
+
+   In an existing clone, run `git checkout macos-demo-app && git submodule update --init --recursive` instead.
+
+3. Create the Python environment with both extras. Without `mac`, macOS has no onnxruntime and the server cannot start, nor coremltools for the Neural Engine. Without `audio`, there is no Silero VAD or RE-USE.
+
+   ```bash
+   uv sync --extra mac --extra audio
+   ```
+
+4. Download the models.
+
+   ```bash
+   uv run huggingface-cli download FunAudioLLM/Fun-CosyVoice3-0.5B-2512 --local-dir pretrained_models/Fun-CosyVoice3-0.5B-2512
+   uv run huggingface-cli download slpr-lab/DELTA-TTS --local-dir pretrained_models/DELTA-TTS
+   uv run huggingface-cli download nvidia/NVIDIA-NemotronLabs-RE-USE --local-dir pretrained_models/RE-USE
+   ```
+
+   To work offline, set `server.reuse_dir` in `demo/config.json` (or Settings > Server) to `pretrained_models/RE-USE`. Otherwise the server downloads RE-USE from Hugging Face on the first recording.
+
+5. Optional, for a faster Fast mode: export the Neural Engine model. It takes about 5 minutes, peaks at about 13 GB of RAM and writes `pretrained_models/DELTA-TTS/delta_tts_ane.mlmodelc` (0.85 GB). Copying that folder from another Mac works too. Without it, Fast runs in float16 on the GPU.
+
+   ```bash
+   uv run --extra mac python -m delta_tts.coreml export
+   ```
+
+6. Build the app. It remembers the clone it was built from, so build it in the clone you will run; Settings > General > Repository can point it elsewhere. You can move the app to /Applications.
+
+   ```bash
+   demo/DeltaTTSDemo/make_app.sh    # -> demo/DeltaTTSDemo/build/DeltaTTSDemo.app
+   ```
+
+7. Start the app and the server.
+
+   ```bash
+   open demo/DeltaTTSDemo/build/DeltaTTSDemo.app
+   ```
+
+   - Start the server from Settings (Command-,) > General > Start Server, or in a terminal with `uv run --extra mac --extra audio python demo/server.py` (keep the terminal open).
+   - The model loads in about 10 s.
+   - The Neural Engine then warms up in the background: about a minute the first time on a Mac, a few seconds afterwards. The header shows "Fast: warming up n/7", then "Fast ready".
+   - Allow microphone access when macOS asks, on the first recording.
+
+8. Before visitors:
+   - Connect the headphones; the app plays to the system default output.
+   - Pick the microphone in the header.
+   - Choose Mode: Fast once "Fast ready" shows.
+   - Record and generate once as a test.
+   - Go full screen (Control-Command-F).
+   - Press Next visitor (Command-N) between visitors.
+
+Troubleshooting:
+
+| Problem | Fix |
+|---|---|
+| The server log says "Fast mode: no Neural Engine" | The `mac` extra (step 3) or the exported model (step 5) is missing. |
+| The server log says "Cannot listen on 127.0.0.1:8765" | Another server is running. Stop it, or change `server.port`. |
+| The app cannot record | Allow DeltaTTSDemo in System Settings > Privacy & Security > Microphone. |
+| macOS refuses to open an app copied from another Mac | Build it on this Mac (step 6), or run `xattr -dr com.apple.quarantine DeltaTTSDemo.app`. |
+| Testing the app without the model | `uv run --extra mac --extra audio python demo/server.py --dry-run` returns a tone of the estimated length. |
+
+### How it works
 
 - Use the app bundle: macOS grants microphone access only to apps whose Info.plist explains it. `make_app.sh` builds the release binary, writes that Info.plist and signs the bundle ad hoc; macOS asks for the microphone on the first recording (if access was denied, allow DeltaTTSDemo in System Settings > Privacy & Security > Microphone). A rebuilt bundle may be asked again. `swift run` in `demo/DeltaTTSDemo` also works, with sample voices only.
 - The main screen shows four steps as a guide: read and record (a countdown, then the sentence shown large while recording, up to 12 s), type what to say, generate, listen. One button in a fixed place at the bottom does the next thing: Record your voice, Stop, Generate my voice, Play, Play again; Re-record, Play my recording and Edit text sit beside it. Shortcuts: Space (the next step, when no text field has focus), Command-R record or stop, Command-G or Return in the text generate, Command-P play, Command-N next visitor.
 - As soon as a recording stops, the app sends the whole recording to `POST /prepare`, which enhances it (RE-USE, which estimates the noise from the edges without speech), then trims it (Silero VAD) and caches its features while the visitor reads step 2. It returns the processed audio, which "Play my recording" plays: what the model will use. It stays next to the primary button after generation, so the recording and the generated voice can be compared. Step 1 shows "Preparing your voice..." and then "Ready", with warnings such as no speech found; a failure offers Record again. The app trims silence itself only when the server's `trim_prompt` is off. Both prompt processing steps are on by default (`processing` in the config; needs the `audio` extra).
 - Generate then sends the returned `prompt_id`, so it only generates. While it runs, the primary spot shows the stage over a progress bar fed by `GET /progress`, which follows the pipeline's progress reports: the prompt (only if it was not prepared), the DELTA-TTS tokens (one step per forward pass), the acoustic model (10 flow-matching steps) and the vocoder.
 - After the first full listen the primary button reads "Play again", with "Regenerate" (Command-G) beside it: it generates again from the same prepared prompt and text, so it shows how fast generation alone is (at temperature 0 the result is the same audio). "Next visitor" (at the top right, in the action bar once the voice has been heard, and Command-N) cancels what is in flight, deletes the recording, clears the app and asks the server to forget it (`POST /reset`).
-- The header has the microphone, the output device and the mode (exact or fast); Settings edits the same values. At start the server warms up the fast backend in the background (`DeltaTTSPipeline.prewarm_fast()`; `server.prewarm_fast`, on by default), whatever the mode, so the Neural Engine is loaded by the time Fast is chosen. The header shows it in either mode ("Fast: warming up 3/7", "Fast ready" briefly, or "Fast unavailable"), choosing Fast switches the server at once (`POST /compute`), and visitors see one quiet line only while Fast is selected and not ready, since the first voices are slower until then. `--dry-run` simulates this warm-up over about 20 s (`--dry-run-fast-fails` simulates a failure). The Mode tooltip says how much faster Fast is: measured on this Mac once each mode has 3 clean generations (generation stages only, without a float32 fallback or warm-up), else `demo.fast_speedup_percent` from the config (20, measured end to end on an M4 Pro), else without a number. Recording uses the system default microphone unless one is chosen. Playback uses the system default output unless one is chosen; a chosen output gives way to the system default when that changes (e.g. headphones plugged in). Leading and trailing silence of a recording is cut before upload.
+- The header has the microphone, the output device and the mode (exact or fast); Settings edits the same values. At start the server warms up the fast backend in the background (`DeltaTTSPipeline.prewarm_fast()`; `server.prewarm_fast`, on by default), whatever the mode, so the Neural Engine is loaded by the time Fast is chosen. The header shows it in either mode ("Fast: warming up 3/7", "Fast ready" briefly, or "Fast unavailable"), choosing Fast switches the server at once (`POST /compute`), and visitors see one quiet line only while Fast is selected and not ready, since the first voices are slower until then. `--dry-run` simulates this warm-up over about 20 s (`--dry-run-fast-fails` simulates a failure). The Mode tooltip says how much faster Fast is: measured on this Mac once each mode has 3 clean generations (generation stages only, without a float32 fallback or warm-up), else `demo.fast_speedup_percent` from the config (20, measured end to end on an M4 Pro), else without a number. Recording uses the system default microphone unless one is chosen. Playback uses the system default output unless one is chosen; a chosen output gives way to the system default when that changes (e.g. headphones plugged in).
 - Generation timings (RTF) are not shown to visitors; they are in Settings > General and on the app's standard output.
 - Recordings are kept in a private temporary folder and deleted on Next visitor and when the app quits. The server keeps uploads only in its own temporary folder, removed by `/reset` and when it exits.
 - Settings (Command-,) edit every section of the config, start and stop the server, and show its log. They are saved to `~/Library/Application Support/DeltaTTSDemo/config.json` (or `$DELTA_TTS_DEMO_CONFIG`), which the app passes to a server it starts; Reset to Defaults reloads `demo/config.json`. `app.ui_scale` sets the size of the main screen.
