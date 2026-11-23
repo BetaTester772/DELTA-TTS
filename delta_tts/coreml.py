@@ -66,11 +66,12 @@ logger = logging.getLogger(__name__)
 # Buckets
 # -----------------------------
 # Each bucket is at most a third longer than the previous one, which bounds the padding. Every
-# bucket costs a compilation (about 10 s) and about 0.85 GB of macOS cache when used. Buckets
-# 768 and 1024 are left out: they were only 2% faster than float32 on MPS (and slower than
-# float16 on MPS), so longer sequences run in float32 (README).
-BUCKETS = (192, 256, 320, 384, 512, 640)
-TYPICAL_SEQ_LEN = 300  # about 5 s of prompt and 5 s of output; buckets are prepared nearest first
+# bucket costs a compilation (about 10 s) and about 0.85 GB of macOS cache when used, so a bucket
+# is kept only where it is clearly faster than the next one or than MPS (README): 128 is left
+# out (rarely reached), and so are 768 and 1024 (only 2% faster than float32 on MPS, slower
+# than float16 on MPS); longer sequences run in float32.
+BUCKETS = (160, 192, 256, 320, 384, 512, 640)
+TYPICAL_SEQ_LEN = 250  # about 4 s of prompt and 4 s of output; buckets are prepared nearest first
 INPUT_DIM = HIDDEN_DIM + 1  # embedding + real-position channel
 MODEL_NAME = "delta_tts_ane.mlmodelc"
 
