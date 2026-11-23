@@ -8,6 +8,7 @@ Endpoints (JSON)
     GET  /health       status ("loading", "ready" or "error"), device, compute, sample_rate, dry_run
     GET  /config       the config, with preset paths resolved
     POST /synthesize   text and prompt in; base64 WAV, timing and warnings out
+    POST /reset        forget the previous visitor: uploaded prompts and cached prompt features
 
 Every notice in "warnings" is {level: "info" | "warning" | "error", code, message}. A request
 that cannot be served gets an HTTP 4xx/5xx status and {error, code, warnings}.
@@ -238,6 +239,16 @@ class UploadStore:
         self._files.move_to_end(target)
         self._evict()
         return target
+
+    def clear(self) -> int:
+        """Delete every stored upload. Returns: the number of files removed."""
+        removed = 0
+        for path in self.dir.iterdir():
+            if path.is_file() or path.is_symlink():
+                path.unlink(missing_ok=True)
+                removed += 1
+        self._files.clear()
+        return removed
 
     def close(self) -> None:
         shutil.rmtree(self.dir, ignore_errors=True)
@@ -552,6 +563,18 @@ class TTSService:
         config["repo_root"] = str(REPO_ROOT)
         return config
 
+    def reset(self) -> dict[str, Any]:
+        """Forget the previous visitor: delete the uploaded prompts and clear the pipeline's
+        cached prompt features, which include speaker embeddings. Waits for a running synthesis."""
+        with self._lock:
+            removed = self.uploads.clear()
+            cleared = 0
+            if self.tts is not None:
+                cleared = len(self.tts._prompt_cache)
+                self.tts._prompt_cache.clear()
+        logger.info("Reset: removed %d uploaded prompts and %d cached prompt features", removed, cleared)
+        return {"status": "ok", "removed_uploads": removed, "cleared_prompt_features": cleared}
+
     def synthesize(self, body: dict[str, Any], notices: list[Notice]) -> dict[str, Any]:
         """Serve one /synthesize request. Notices are appended to `notices` as they arise."""
         if self.status == "loading":
@@ -694,15 +717,19 @@ class Handler(BaseHTTPRequestHandler):
         notices: list[Notice] = []
         try:
             self._check_client()
-            if path != "/synthesize":
+            if path == "/synthesize":
+                result = self.service.synthesize(self._read_json(), notices)
+            elif path == "/reset":
+                self._read_json()  # same Content-Type and size checks as /synthesize; the body is ignored
+                result = self.service.reset()
+            else:
                 raise RequestError(HTTPStatus.NOT_FOUND, "not_found", "No such endpoint")
-            result = self.service.synthesize(self._read_json(), notices)
         except RequestError as e:
             self._send_error(e, notices)
         except Exception as e:
-            logger.exception("Synthesis failed")
-            error = RequestError(HTTPStatus.INTERNAL_SERVER_ERROR, "synthesis_failed",
-                                 f"Synthesis failed: {type(e).__name__}: {e}")
+            logger.exception("%s failed", path)
+            code, what = ("synthesis_failed", "Synthesis") if path == "/synthesize" else ("reset_failed", "Reset")
+            error = RequestError(HTTPStatus.INTERNAL_SERVER_ERROR, code, f"{what} failed: {type(e).__name__}: {e}")
             self._send_error(error, notices)
         else:
             self._send(HTTPStatus.OK, result)
