@@ -189,6 +189,12 @@ class DeltaTTS(nn.Module):
             raise KeyError(f"Missing keys in {path}: {sorted(missing)[:5]}")
         logger.info("Loaded %d DELTA-TTS tensors from %s", len(state), path)
 
+    def merge_lora(self) -> None:
+        """Fold the LoRA adapters into the backbone weights (W + scaling * B A). Call after
+        `load_checkpoint`. The forward pass then skips the separate low-rank products; the
+        result is the same up to float rounding."""
+        self.bidirectional_encoder.qwen2_model.merge_adapter()
+
     @torch.no_grad()
     def logits(self, text_token: torch.Tensor, speech_token: torch.Tensor) -> torch.Tensor:
         """Output logits for the sequence [SOS, text, TASK, speech].

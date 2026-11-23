@@ -98,22 +98,25 @@ def generate(
         # -----------------------------
         # 3. Commit, limiting repeats of the same token
         # -----------------------------
-        committed, count = [], {}
+        # The loop reads single values, so it works on Python copies: on a GPU, every read of a
+        # device tensor would wait for the device.
+        current, masked, predicted_list = speech_tokens[0].tolist(), is_masked.tolist(), predicted.tolist()
+        committed: list[int] = []
+        count: dict[int, int] = {}
         for pos in candidates:
-            token = int(predicted[pos])
-            if _run_length(speech_tokens, is_masked, target, pos, token) >= MAX_REPEAT:
+            token = predicted_list[pos]
+            if _run_length(current, masked, target, pos, token) >= MAX_REPEAT:
                 for alternative in logits[pos].argsort(descending=True)[1:].tolist():
-                    if alternative < SPEECH_TOKEN_SIZE and _run_length(speech_tokens, is_masked, target, pos, alternative) < MAX_REPEAT:
+                    if alternative < SPEECH_TOKEN_SIZE and _run_length(current, masked, target, pos, alternative) < MAX_REPEAT:
                         token = alternative
                         break
-                predicted[pos] = token
+                predicted_list[pos] = token
             if count.get(token, 0) < MAX_REPEAT:
                 count[token] = count.get(token, 0) + 1
                 committed.append(pos)
-        committed = torch.tensor(committed, dtype=torch.long, device=device)  # (n_committed,)
-
-        speech_tokens[0, prompt_len + committed] = predicted[committed]
-        is_masked[prompt_len + committed] = False
+        positions = torch.tensor([prompt_len + pos for pos in committed], dtype=torch.long, device=device)  # (n_committed,)
+        speech_tokens[0, positions] = torch.tensor([predicted_list[pos] for pos in committed], dtype=torch.long, device=device)
+        is_masked[positions] = False
 
     # -----------------------------
     # Positions still masked after the last step get their most likely token
@@ -178,14 +181,14 @@ def top_p_filter(logits: torch.Tensor, top_p: float) -> torch.Tensor:
     return sorted_logits.scatter(1, sorted_idx, sorted_logits)  # (num_positions, vocab_size)
 
 
-def _run_length(speech_tokens: torch.Tensor, is_masked: torch.Tensor, target: slice, pos: int, token: int) -> int:
+def _run_length(speech_tokens: list[int], is_masked: list[bool], target: slice, pos: int, token: int) -> int:
     """Length of the run of `token` that placing it at target position `pos` would create.
 
     Only committed neighbours inside the target are counted.
 
     Args:
-        speech_tokens: Current speech tokens. Shape: (1, speech_seq_len)
-        is_masked: Masked positions. Shape: (speech_seq_len,)
+        speech_tokens: Current speech tokens. Length: speech_seq_len
+        is_masked: Masked positions. Length: speech_seq_len
         target: Positions of the target in `speech_tokens`.
         pos: Position inside the target.
         token: Candidate token id.
@@ -193,7 +196,7 @@ def _run_length(speech_tokens: torch.Tensor, is_masked: torch.Tensor, target: sl
     run = 1
     for direction in (-1, 1):
         p = target.start + pos + direction
-        while target.start <= p < target.stop and not is_masked[p] and int(speech_tokens[0, p]) == token:
+        while target.start <= p < target.stop and not is_masked[p] and speech_tokens[p] == token:
             run += 1
             p += direction
     return run
