@@ -127,6 +127,25 @@ DELTA-TTS forward per unmasking step (embeddings, Core ML call and logits back o
 
 On the 8 zero-shot prompts of the demo page (150 to 452 positions; measured with buckets 192 to 1024), the Neural Engine gives 73% of the float32 speech tokens (float16 on MPS: 97%), and Whisper (base.en) finds no word errors in the float32, Neural Engine or float16 outputs. The Neural Engine saturates instead of producing inf/NaN, so its float32 fallback catches non-finite outputs but not a saturated activation; on these prompts the largest activation in float32 is 3115, 5% of the float16 range.
 
+## Demo app
+
+A macOS app (SwiftUI, Liquid Glass; macOS 26 or newer) in `demo/DeltaTTSDemo` talks to a small local server, `demo/server.py`, which keeps the model loaded.
+Both read `demo/config.json`: server settings, prompt presets (the prompts of the demo page), synthesis and processing defaults, and warning thresholds.
+
+```bash
+uv run python demo/server.py              # loads the model; GET /health reports "loading", then "ready"
+uv run python demo/server.py --dry-run    # no model: returns a tone of the estimated output length
+cd demo/DeltaTTSDemo && swift build && swift run
+```
+
+- The app can also start the server itself (Start Server; Settings > General sets the repository path, the uv path and dry-run mode).
+- Settings (Cmd-,) edit every section of the config. They are saved to `~/Library/Application Support/DeltaTTSDemo/config.json`, which the app passes to a server it starts; Reset to Defaults reloads `demo/config.json`.
+- `POST /synthesize` takes `text`, `prompt_text`, `prompt_wav_base64` (or `prompt_wav_path`) and optional synthesis and processing fields, and returns a base64 WAV with `duration_s`, `elapsed_s`, `rtf` and `warnings` (`{level, code, message}`): the library's logged warnings, the fast mode's float32 fallback, and checks of the text, transcript, prompt and estimated output length.
+
+Security: the server is for local use by the app and must not be exposed to a network.
+It listens on 127.0.0.1 and accepts only loopback `Host` headers; it rejects requests with an `Origin` header (unless listed in `server.allowed_origins`), sends no CORS headers, and requires `Content-Type: application/json` on POST, so that web pages cannot use it.
+`prompt_wav_path` must point inside the repository, a preset directory or the upload directory; uploads are limited to 18 MB and 60 s, checked before they are stored, and kept in a private temporary directory of at most 32 files and 200 MB.
+
 ## Evaluation
 
 WER and SIM are computed with the [evaluation code of F5-TTS](https://github.com/SWivid/F5-TTS/tree/main/src/f5_tts/eval), included as a submodule and used without modification.
