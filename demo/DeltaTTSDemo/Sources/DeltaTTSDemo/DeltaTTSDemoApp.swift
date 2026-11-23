@@ -10,7 +10,16 @@ struct DeltaTTSDemoApp: App {
             ContentView()
                 .environment(appDelegate.model)
         }
-        .defaultSize(width: 760, height: 860)
+        .windowStyle(.hiddenTitleBar)
+        .defaultSize(width: 1280, height: 800)
+        .commands {
+            CommandGroup(replacing: .newItem) {
+                Button("Next visitor") {
+                    Task { await appDelegate.model.nextVisitor() }
+                }
+                .keyboardShortcut("n", modifiers: .command)
+            }
+        }
 
         Settings {
             SettingsView()
@@ -19,8 +28,8 @@ struct DeltaTTSDemoApp: App {
     }
 }
 
-/// Owns the model, brings the app to the front when it is started from a terminal (it is not
-/// an app bundle), and stops a server the app started when it quits.
+/// Owns the model, brings the app to the front when it is started from a terminal, and on quit
+/// deletes the recordings, asks the server to forget the visitor and stops a server it started.
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private(set) lazy var model = AppModel()  // created on first use, on the main actor
@@ -33,6 +42,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
 
     func applicationWillTerminate(_ notification: Notification) {
-        model.serverProcess.terminate()
+        model.cleanUpForQuit()
     }
 }

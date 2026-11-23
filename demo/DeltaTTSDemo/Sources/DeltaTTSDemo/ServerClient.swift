@@ -83,6 +83,19 @@ struct SynthesisResponse: Decodable, Sendable {
     }
 }
 
+/// POST /reset response.
+struct ResetResponse: Decodable, Sendable {
+    var status: String
+    var removedUploads: Int?
+    var clearedPromptFeatures: Int?
+
+    enum CodingKeys: String, CodingKey {
+        case status
+        case removedUploads = "removed_uploads"
+        case clearedPromptFeatures = "cleared_prompt_features"
+    }
+}
+
 /// Body of an error response.
 private struct ErrorResponse: Decodable {
     var error: String
@@ -129,6 +142,29 @@ struct ServerClient: Sendable {
         request.httpBody = try encoder.encode(body)
         request.timeoutInterval = 900  // long texts on a slow device
         return try await send(request, as: SynthesisResponse.self)
+    }
+
+    /// Make the server forget the previous visitor (uploaded prompts, cached prompt features).
+    func reset(timeout: TimeInterval = 10) async throws -> ResetResponse {
+        var request = URLRequest(url: baseURL.appending(path: "reset"))
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = Data("{}".utf8)
+        request.timeoutInterval = timeout
+        return try await send(request, as: ResetResponse.self)
+    }
+
+    /// `reset` that blocks for at most `timeout` seconds, for use while the app quits (the main
+    /// run loop no longer serves async work then). The response is not checked.
+    func resetBlocking(timeout: TimeInterval) {
+        var request = URLRequest(url: baseURL.appending(path: "reset"))
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = Data("{}".utf8)
+        request.timeoutInterval = timeout
+        let done = DispatchSemaphore(value: 0)
+        URLSession.shared.dataTask(with: request) { _, _, _ in done.signal() }.resume()
+        _ = done.wait(timeout: .now() + timeout)
     }
 
     private func send<T: Decodable>(_ request: URLRequest, as type: T.Type) async throws -> T {

@@ -1,12 +1,12 @@
+import AppKit
 import AVFoundation
 import Foundation
 import Observation
 
-/// Which prompt the user picked: a preset of the config or a file of their own.
+/// Whose voice is the prompt: the visitor's recording or a sample voice (a preset).
 enum PromptSelection: Hashable {
-    case none
+    case recording
     case preset(UUID)
-    case file
 }
 
 /// Duration and sample rate of a prompt file, as AVFoundation reads them.
@@ -24,18 +24,30 @@ enum ServerState: Equatable {
     case failed(String)
 }
 
-/// The last synthesized output.
+/// The last generated output, and the inputs it was made from.
 struct SynthesisOutput {
     var wav: Data
     var response: SynthesisResponse
+    var inputKey: String
+}
+
+/// The line under the header that says what to do now.
+struct Instruction: Equatable {
     var text: String
-    var date = Date()
+    var level: Notice.Level
+    var systemImage: String
 }
 
 struct AlertItem: Identifiable {
     let id = UUID()
     var title: String
     var message: String
+}
+
+/// An extra button on a notice.
+struct NoticeAction {
+    var title: String
+    var perform: () -> Void
 }
 
 /// App state shared by the main window and the Settings scene.
@@ -48,11 +60,13 @@ final class AppModel {
     }
 
     // Inputs
-    private(set) var selection: PromptSelection = .none
-    private(set) var customPromptURL: URL?
-    var transcript = ""
+    private(set) var selection = PromptSelection.recording
     var text = "" {
-        didSet { if !text.isEmpty { attemptedWithoutInput = false } }
+        didSet {
+            if !text.isEmpty { attemptedWithoutInput = false }
+            if text != oldValue { generationError = nil }
+            if text != oldValue, text != config.demo.defaultText { readyForNextVisitor = false }
+        }
     }
 
     // Server
@@ -60,15 +74,25 @@ final class AppModel {
     private(set) var healthError: String?
     let serverProcess = ServerProcess()
 
-    // Synthesis
+    // Recording and playback
+    let recorder = VoiceRecorder()
+    let player = AudioPlayer()  // the generated voice
+    let promptPlayer = AudioPlayer()  // the recording or a sample voice
+    let audioDevices = AudioDevices()
+    private(set) var missingMicrophone: String?  // the chosen microphone was not connected at the last recording
+    private(set) var noMicrophone = false
+
+    // Generation
     private(set) var isSynthesizing = false
     private(set) var output: SynthesisOutput?
+    private(set) var generationError: String?
     private(set) var serverNotices: [Notice] = []
+    private(set) var isResetting = false
+    private(set) var readyForNextVisitor = false  // shown briefly after Next visitor
+    private var resetNotice: Notice?
     private var dismissedNotices: Set<String> = []
     private var attemptedWithoutInput = false
     var alert: AlertItem?
-    let player = AudioPlayer()
-    let promptPlayer = AudioPlayer()
 
     /// The voice-cloning notice was acknowledged with "Don't show again".
     var consentAcknowledged: Bool {
@@ -78,6 +102,7 @@ final class AppModel {
     nonisolated static let consentKey = "voiceCloningNoticeAcknowledged"
     nonisolated static let maxUploadBytes = 18 * 1024 * 1024  // MAX_UPLOAD_BYTES of demo/server.py
 
+    @ObservationIgnored private var visitor = UUID()  // replaced by Next visitor; late results of the previous visitor are dropped
     @ObservationIgnored private var saveTask: Task<Void, Never>?
     @ObservationIgnored private var promptInfoCache: [String: Result<PromptInfo, PromptError>] = [:]
 
@@ -101,9 +126,10 @@ final class AppModel {
         }
         self.config = config
         consentAcknowledged = UserDefaults.standard.bool(forKey: Self.consentKey)
-        if let preset = config.presets.first {
-            selection = .preset(preset.id)
-            transcript = preset.transcript
+        text = config.demo.defaultText
+        audioDevices.onDefaultOutputChange = { [weak self] in
+            self?.player.outputDeviceChanged()
+            self?.promptPlayer.outputDeviceChanged()
         }
         if let loadError {
             alert = AlertItem(title: "Cannot read your settings", message: loadError)
@@ -118,44 +144,35 @@ final class AppModel {
         return config.presets.first { $0.id == id }
     }
 
+    /// The prompt audio: the recording, or the sample voice's file.
     var promptURL: URL? {
         switch selection {
-        case .none: nil
+        case .recording: recorder.take?.url
         case .preset: selectedPreset.map { config.resolve($0.wav) }
-        case .file: customPromptURL
         }
     }
 
-    var promptName: String {
+    /// The words spoken in the prompt: the sentence read aloud, or the sample voice's transcript.
+    var transcript: String {
         switch selection {
-        case .none: "No prompt"
-        case .preset: selectedPreset?.name ?? "No prompt"
-        case .file: customPromptURL?.lastPathComponent ?? "No prompt"
+        case .recording: config.demo.defaultTranscript
+        case .preset: selectedPreset?.transcript ?? ""
         }
     }
 
-    func select(_ selection: PromptSelection) {
-        guard selection != self.selection else { return }
+    func useSampleVoice(_ id: UUID) {
         promptPlayer.unload()
-        self.selection = selection
-        switch selection {
-        case .preset: transcript = selectedPreset?.transcript ?? ""
-        case .file, .none: transcript = ""
-        }
+        selection = .preset(id)
     }
 
-    func useCustomPrompt(_ url: URL) {
+    func useOwnVoice() {
         promptPlayer.unload()
-        customPromptURL = url
-        selection = .file
-        transcript = ""
+        selection = .recording
     }
 
     /// Keep the selection valid after the presets change (edits in Settings, reset).
     func presetsChanged() {
-        if case .preset = selection, selectedPreset == nil {
-            select(config.presets.first.map { .preset($0.id) } ?? .none)
-        }
+        if case .preset = selection, selectedPreset == nil { useOwnVoice() }
     }
 
     /// Duration and sample rate of the current prompt, or why it cannot be read.
@@ -182,7 +199,8 @@ final class AppModel {
         return result
     }
 
-    func togglePromptPreview() {
+    /// Play or stop the recording (or the sample voice).
+    func togglePromptPlayback() {
         if promptPlayer.isPlaying {
             promptPlayer.stop()
             return
@@ -193,8 +211,70 @@ final class AppModel {
             player.stop()
             promptPlayer.play()
         } catch {
-            alert = AlertItem(title: "Cannot play the prompt", message: error.localizedDescription)
+            alert = AlertItem(title: "Cannot play the recording", message: error.localizedDescription)
         }
+    }
+
+    // -----------------------------
+    // Recording
+    // -----------------------------
+    var canRecord: Bool {
+        recorder.access != .denied && recorder.access != .needsAppBundle && !isSynthesizing && !isResetting
+    }
+
+    func startRecording() {
+        readyForNextVisitor = false
+        promptPlayer.unload()
+        player.stop()
+        selection = .recording
+        generationError = nil
+        guard let device = inputDeviceForRecording() else {
+            noMicrophone = true
+            return
+        }
+        noMicrophone = false
+        let settings = config.recording
+        recorder.start(device: device, countdown: settings.countdownSeconds, maxSeconds: settings.maxSeconds,
+                       sampleRate: settings.sampleRate, trimSilence: settings.trimSilence)
+    }
+
+    /// The chosen microphone, or the system default input when none is chosen or the chosen one
+    /// is not connected.
+    private func inputDeviceForRecording() -> AVCaptureDevice? {
+        missingMicrophone = nil
+        let chosen = config.recording.inputDeviceUid
+        if !chosen.isEmpty {
+            if let device = audioDevices.captureDevice(uniqueID: chosen) { return device }
+            missingMicrophone = config.recording.inputDeviceName.isEmpty ? "The chosen microphone" : config.recording.inputDeviceName
+        }
+        return AVCaptureDevice.default(for: .audio)
+    }
+
+    /// Record from `device`, or from the system default input when nil.
+    func chooseMicrophone(_ device: InputDevice?) {
+        config.recording.inputDeviceUid = device?.id ?? ""
+        config.recording.inputDeviceName = device?.name ?? ""
+        missingMicrophone = nil
+    }
+
+    /// "System default (MacBook Pro Microphone)", the chosen microphone, or "... (not connected)".
+    var microphoneLabel: String {
+        let chosen = config.recording.inputDeviceUid
+        if chosen.isEmpty {
+            return "System default" + (audioDevices.defaultInputName.map { " (\($0))" } ?? "")
+        }
+        if let device = audioDevices.inputs.first(where: { $0.id == chosen }) { return device.name }
+        let name = config.recording.inputDeviceName.isEmpty ? "Chosen microphone" : config.recording.inputDeviceName
+        return "\(name) (not connected)"
+    }
+
+    /// "Output: MacBook Pro Speakers (system default)".
+    var outputLabel: String {
+        "Output: \(audioDevices.defaultOutputName ?? "unknown device") (system default)"
+    }
+
+    func stopRecording() {
+        recorder.stop()
     }
 
     // -----------------------------
@@ -252,18 +332,30 @@ final class AppModel {
     }
 
     // -----------------------------
-    // Synthesis
+    // Generation
     // -----------------------------
-    /// Why synthesis cannot start now, if it cannot.
+    /// Identifies the inputs of a generation, to tell whether the output is still current.
+    private var inputKey: String {
+        let prompt = switch selection {
+        case .recording: recorder.take?.url.path ?? ""
+        case .preset(let id): id.uuidString
+        }
+        return "\(prompt)|\(transcript)|\(text)"
+    }
+
+    var outputIsCurrent: Bool {
+        output?.inputKey == inputKey
+    }
+
+    /// Why generation cannot start now, in plain words, if it cannot.
     var blockingReason: String? {
-        if text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return "Enter the text to synthesize." }
-        guard promptURL != nil else { return "Choose a voice prompt." }
-        if case .failure = promptInfo { return "The prompt audio cannot be read." }
+        if recorder.isCapturing { return "Finish the recording first." }
+        guard promptURL != nil else { return "Record your voice first." }
+        if case .failure = promptInfo { return "The recording cannot be read. Please record again." }
+        if text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return "Type what your voice should say." }
         switch serverState {
-        case .unknown: return "Checking the server..."
-        case .unreachable: return "The server is not reachable."
-        case .loading: return "The server is still loading the model."
-        case .failed: return "The server failed to load the model."
+        case .unknown, .loading: return "The voice engine is starting. Please wait."
+        case .unreachable, .failed: return "The voice engine is not running. Please ask a staff member."
         case .ready: return nil
         }
     }
@@ -274,38 +366,178 @@ final class AppModel {
             attemptedWithoutInput = true
             return
         }
+        let visitor = self.visitor
+        let key = inputKey
         isSynthesizing = true
+        generationError = nil
         defer { isSynthesizing = false }
         player.stop()
         promptPlayer.stop()
         do {
             let audio = try Data(contentsOf: promptURL)
-            guard audio.count <= Self.maxUploadBytes else {
-                throw PromptError.tooLarge(audio.count)
-            }
+            guard audio.count <= Self.maxUploadBytes else { throw PromptError.tooLarge(audio.count) }
             let s = config.synthesis, p = config.processing
             let request = SynthesisRequest(
                 text: text, promptText: transcript,
-                promptWavBase64: audio.base64EncodedString(), promptWavName: promptURL.lastPathComponent,
+                promptWavBase64: audio.base64EncodedString(),
+                promptWavName: selection == .recording ? "recording.wav" : promptURL.lastPathComponent,
                 lengthScale: s.lengthScale, numSteps: s.numSteps, temperature: s.temperature, topP: s.topP,
                 tShift: s.tShift, compute: s.compute,
                 enhancePrompt: p.enhancePrompt, trimPrompt: p.trimPrompt, trimOutput: p.trimOutput,
                 warnings: config.warnings)
             let response = try await client.synthesize(request)
+            guard visitor == self.visitor else { return }  // Next visitor was pressed meanwhile
             guard let wav = Data(base64Encoded: response.audioWavBase64) else {
                 throw ServerError.invalidResponse("the audio is not valid base64")
             }
             try player.load(data: wav)
-            output = SynthesisOutput(wav: wav, response: response, text: text)
+            output = SynthesisOutput(wav: wav, response: response, inputKey: key)
             serverNotices = response.warnings
             attemptedWithoutInput = false
             player.play()
-        } catch let error as ServerError {
-            serverNotices = error.notices
-            alert = AlertItem(title: "Synthesis failed", message: error.localizedDescription)
         } catch {
-            alert = AlertItem(title: "Synthesis failed", message: error.localizedDescription)
+            guard visitor == self.visitor else { return }
+            if let error = error as? ServerError {
+                serverNotices = error.notices.filter { $0.level != .error }
+                if case .http(_, let message, _) = error { generationError = message } else { generationError = error.localizedDescription }
+            } else {
+                generationError = error.localizedDescription
+            }
         }
+    }
+
+    /// "4.1 s of speech, made in 1.3 s (3.2x faster than real time)".
+    func speedSummary(_ response: SynthesisResponse) -> String {
+        var summary = "\(formatSeconds(response.durationSeconds)) of speech, made in \(formatSeconds(response.elapsedSeconds))"
+        if let rtf = response.rtf, rtf > 0 {
+            summary += rtf < 1
+                ? String(format: " (%.1fx faster than real time)", 1 / rtf)
+                : String(format: " (real-time factor %.2f)", rtf)
+        }
+        if response.dryRun == true { summary += " · test tone" }
+        return summary
+    }
+
+    // -----------------------------
+    // Steps and instructions
+    // -----------------------------
+    /// 1 record, 2 type, 3 generate, 4 listen.
+    var currentStep: Int {
+        if recorder.isCapturing || promptURL == nil { return 1 }
+        if text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return 2 }
+        return outputIsCurrent ? 4 : 3
+    }
+
+    func status(ofStep step: Int) -> StepStatus {
+        let current = currentStep
+        if step == current { return .current }
+        if step < current { return .done }
+        return step == 4 && output != nil ? .done : .upcoming
+    }
+
+    var instruction: Instruction {
+        switch recorder.state {
+        case .countdown:
+            return Instruction(text: "Get ready to read the sentence aloud...", level: .info, systemImage: "timer")
+        case .recording:
+            return Instruction(text: "Read the sentence aloud now, then press Stop.", level: .info, systemImage: "waveform")
+        case .idle:
+            break
+        }
+        if isResetting {
+            return Instruction(text: "Clearing everything for the next visitor...", level: .info, systemImage: "arrow.counterclockwise")
+        }
+        if readyForNextVisitor {
+            return Instruction(text: "Ready for the next visitor.", level: .info, systemImage: "checkmark.circle")
+        }
+        if isSynthesizing {
+            return Instruction(text: "Generating your voice. This takes a few seconds...", level: .info, systemImage: "waveform")
+        }
+        if let generationError {
+            return Instruction(text: "Could not generate your voice: \(generationError) Please try again.",
+                               level: .error, systemImage: "exclamationmark.triangle.fill")
+        }
+        switch currentStep {
+        case 1:
+            if selection == .recording, !canRecord, !isSynthesizing {
+                return Instruction(text: "The microphone is not available. Use a sample voice in step 1.",
+                                   level: .warning, systemImage: "mic.slash")
+            }
+            return Instruction(text: "Press \"Record your voice\", then read the sentence aloud.", level: .info, systemImage: "mic")
+        case 2:
+            return Instruction(text: "Type what you want your voice to say.", level: .info, systemImage: "keyboard")
+        case 3:
+            switch serverState {
+            case .ready:
+                return Instruction(text: "Press \"Generate my voice\".", level: .info, systemImage: "sparkles")
+            case .unknown, .loading:
+                return Instruction(text: "The voice engine is starting. Please wait a moment.", level: .warning, systemImage: "hourglass")
+            case .unreachable, .failed:
+                return Instruction(text: "The voice engine is not running. Please ask a staff member.",
+                                   level: .warning, systemImage: "exclamationmark.triangle.fill")
+            }
+        default:
+            return Instruction(text: "Done! Listen to your voice. Press \"Next visitor\" when you are finished.",
+                               level: .info, systemImage: "checkmark.circle")
+        }
+    }
+
+    // -----------------------------
+    // Next visitor and quitting
+    // -----------------------------
+    /// Delete the recording, ask the server to forget it, and start over with the defaults.
+    func nextVisitor() async {
+        visitor = UUID()
+        recorder.deleteAll()
+        recorder.refreshAccess()
+        player.unload()
+        promptPlayer.unload()
+        output = nil
+        generationError = nil
+        serverNotices = []
+        dismissedNotices = []
+        resetNotice = nil
+        missingMicrophone = nil
+        noMicrophone = false
+        attemptedWithoutInput = false
+        promptInfoCache = [:]
+        selection = .recording
+        text = config.demo.defaultText
+
+        defer { showReadyForNextVisitor() }
+        guard let client else { return }
+        isResetting = true
+        defer { isResetting = false }
+        do {
+            _ = try await client.reset()
+        } catch let error as ServerError {
+            if case .unreachable = error { return }  // not running: it keeps nothing (uploads are removed when it exits)
+            resetNotice = Notice(level: .warning, code: "reset_failed", message:
+                "The voice engine could not delete the last recording (\(error.localizedDescription)). Staff: restart it in Settings.")
+        } catch {
+            resetNotice = Notice(level: .warning, code: "reset_failed", message:
+                "The voice engine could not delete the last recording (\(error.localizedDescription)).")
+        }
+    }
+
+    /// Show "Ready for the next visitor" for a few seconds, or until the visitor starts.
+    private func showReadyForNextVisitor() {
+        readyForNextVisitor = true
+        let visitor = self.visitor
+        Task {
+            try? await Task.sleep(for: .seconds(4))
+            if self.visitor == visitor { readyForNextVisitor = false }
+        }
+    }
+
+    /// While the app quits: delete the recordings, ask the server to forget the visitor (waiting
+    /// at most 1.5 s) and stop a server the app started.
+    func cleanUpForQuit() {
+        recorder.removeDirectory()
+        if serverState == .ready, let client {
+            client.resetBlocking(timeout: 1.5)
+        }
+        serverProcess.terminate()
     }
 
     // -----------------------------
@@ -316,80 +548,124 @@ final class AppModel {
         var notices: [Notice] = []
         if !consentAcknowledged {
             notices.append(Notice(level: .info, code: "consent", message:
-                "Voice cloning: use only prompts from speakers who agreed to it, and do not present "
-                + "synthesized speech as real recordings of them."))
+                "Record only your own voice, and do not use the result to imitate anyone. "
+                + "Your recording is deleted when you press \"Next visitor\"."))
         }
+        if let resetNotice { notices.append(resetNotice) }
         switch serverState {
         case .unknown, .ready: break
-        case .unreachable(let reason):
+        case .unreachable:
             notices.append(Notice(level: .warning, code: "server_unreachable", message:
-                "The server at \(config.serverURL?.absoluteString ?? "(invalid URL)") is \(reason). Start it with "
-                + "\"Start Server\" or `uv run python demo/server.py` in the repository."))
+                "The voice engine is not running. Staff: start it in Settings > General."))
         case .loading:
-            notices.append(Notice(level: .info, code: "server_loading", message: "The server is loading the model..."))
-        case .failed(let error):
-            notices.append(Notice(level: .error, code: "server_failed", message: "The server failed to load the model: \(error)"))
+            notices.append(Notice(level: .info, code: "server_loading", message: "The voice engine is starting..."))
+        case .failed:
+            notices.append(Notice(level: .error, code: "server_failed", message:
+                "The voice engine failed to start. Staff: see the server log in Settings > General."))
         }
         if health?.dryRun == true {
             notices.append(Notice(level: .info, code: "dry_run", message:
-                "The server runs in dry-run mode: outputs are tones as long as the estimated speech, not speech."))
+                "Test mode: the voice engine plays a tone instead of a voice."))
+        }
+
+        if selection == .recording {
+            notices += microphoneNotices
         }
 
         let limits = config.warnings
         if attemptedWithoutInput && text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            notices.append(Notice(level: .warning, code: "text_empty", message: "Enter the text to synthesize."))
+            notices.append(Notice(level: .warning, code: "text_empty", message: "Type something for your voice to say."))
         }
         if Double(text.count) > limits.maxTextChars {
             notices.append(Notice(level: .warning, code: "text_long", message:
-                "The text has \(text.count) characters (more than \(Int(limits.maxTextChars))). DELTA-TTS generates "
-                + "the whole utterance at once; consider splitting long text into sentences."))
+                "That text is long (\(text.count) characters). Shorter sentences work best."))
         }
-        if promptURL == nil {
-            if attemptedWithoutInput {
-                notices.append(Notice(level: .warning, code: "prompt_missing", message: "Choose a voice prompt."))
-            }
-        } else {
+        if promptURL != nil {
             if transcript.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                notices.append(Notice(level: .warning, code: "transcript_missing", message:
-                    "No prompt transcript. DELTA-TTS expects the words spoken in the prompt, and the output length "
-                    + "falls back to a default speaking rate; expect lower quality."))
+                notices.append(Notice(level: .warning, code: "transcript_missing", message: selection == .recording
+                    ? "There is no sentence to read. Staff: set one in Settings > Demo."
+                    : "This sample voice has no transcript. Staff: add it in Settings > Presets."))
             }
             switch promptInfo {
             case .success(let info): notices += promptChecks(info)
-            case .failure(let error):
-                notices.append(Notice(level: .error, code: "prompt_unreadable", message: error.localizedDescription))
+            case .failure:
+                notices.append(Notice(level: .error, code: "prompt_unreadable", message: selection == .recording
+                    ? "The recording could not be read. Please record again."
+                    : "This sample voice's audio file is missing. Staff: check Settings > Presets."))
             case nil: break
             }
-        }
-        if config.synthesis.compute == .fast {
-            notices.append(Notice(level: .info, code: "fast_mode", message:
-                "Fast mode runs DELTA-TTS in float16: outputs differ numerically from exact mode, and an utterance "
-                + "that overflows is finished in float32."))
         }
         return notices
     }
 
+    private var microphoneNotices: [Notice] {
+        var notices: [Notice] = []
+        switch recorder.access {
+        case .denied:
+            notices.append(Notice(level: .error, code: "mic_denied", message:
+                "Microphone access is off. Turn it on in System Settings > Privacy & Security > Microphone, "
+                + "then press Record again. Or use a sample voice."))
+        case .needsAppBundle:
+            notices.append(Notice(level: .warning, code: "mic_needs_app", message:
+                "Recording needs the app bundle: build it with demo/DeltaTTSDemo/make_app.sh. Sample voices still work."))
+        case .granted, .undetermined:
+            break
+        }
+        if let missingMicrophone {
+            notices.append(Notice(level: .warning, code: "mic_missing", message:
+                "\(missingMicrophone) is not connected; using the system default microphone."))
+        }
+        if noMicrophone {
+            notices.append(Notice(level: .error, code: "mic_none", message:
+                "No microphone found. Connect one, or use a sample voice."))
+        }
+        if let failure = recorder.failure {
+            notices.append(Notice(level: .error, code: "recording_failed", message:
+                "The microphone could not record (\(failure)). Check the microphone, or use a sample voice."))
+        }
+        if let take = recorder.take, take.peakDecibels < -55 {
+            notices.append(Notice(level: .warning, code: "recording_silent", message:
+                "We could not hear you. Move closer to the microphone and record again."))
+        }
+        return notices
+    }
+
+    /// The extra button of a notice, if it has one.
+    func action(for notice: Notice) -> NoticeAction? {
+        switch notice.code {
+        case "consent":
+            return NoticeAction(title: "Don't Show Again") { self.consentAcknowledged = true }
+        case "mic_denied":
+            return NoticeAction(title: "Open System Settings") {
+                if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone") {
+                    NSWorkspace.shared.open(url)
+                }
+            }
+        default:
+            return nil
+        }
+    }
+
     private func promptChecks(_ info: PromptInfo) -> [Notice] {
         let limits = config.warnings
+        let mine = selection == .recording
         var notices: [Notice] = []
         let seconds = String(format: "%.1f", info.duration)
         if info.sampleRate < 16000 {
             notices.append(Notice(level: .error, code: "prompt_low_sample_rate", message:
-                "The prompt is sampled at \(Int(info.sampleRate)) Hz; CosyVoice 3 needs at least 16000 Hz."))
+                "The audio quality is too low (\(Int(info.sampleRate)) Hz; at least 16000 Hz is needed)."))
         } else if info.sampleRate < limits.minPromptSampleRate {
             notices.append(Notice(level: .warning, code: "prompt_low_sample_rate", message:
-                "The prompt is sampled at \(Int(info.sampleRate)) Hz (below \(Int(limits.minPromptSampleRate)) Hz); "
-                + "the cloned voice may sound muffled."))
+                "The audio quality is low (\(Int(info.sampleRate)) Hz); the voice may sound muffled."))
         }
         if info.duration < limits.minPromptSeconds {
-            notices.append(Notice(level: .warning, code: "prompt_short", message:
-                "The prompt is \(seconds) s long (under \(limits.minPromptSeconds.formatted()) s); a short prompt gives "
-                + "a less accurate voice and speaking rate."))
+            notices.append(Notice(level: .warning, code: "prompt_short", message: mine
+                ? "Your recording is only \(seconds) s. Record again and read the whole sentence."
+                : "This sample voice is only \(seconds) s long; the result may sound less like it."))
         } else if info.duration > limits.maxPromptSeconds {
             notices.append(Notice(level: info.duration > 30 && !config.processing.trimPrompt ? .error : .warning,
                                   code: "prompt_long", message:
-                "The prompt is \(seconds) s long (over \(limits.maxPromptSeconds.formatted()) s); CosyVoice 3 accepts "
-                + "at most 30 s, and a long prompt slows synthesis."))
+                "The recording is \(seconds) s long; keep it under \(limits.maxPromptSeconds.formatted()) s."))
         }
         return notices
     }
@@ -423,6 +699,7 @@ final class AppModel {
             fresh.app.launchDryRun = config.app.launchDryRun
             config = fresh
             presetsChanged()
+            text = config.demo.defaultText
         } catch {
             alert = AlertItem(title: "Cannot reset to defaults", message: error.localizedDescription)
         }
