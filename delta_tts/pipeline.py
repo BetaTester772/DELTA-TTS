@@ -80,18 +80,23 @@ class DeltaTTSPipeline:
         fast_dtype: Reduced precision of the PyTorch fast mode.
         coreml_model: Compiled Core ML model for the fast mode on MPS. By default the one that
             `python -m delta_tts.coreml export` writes next to `checkpoint`, if it exists.
+
+    `set_compute` switches the mode later; `backend_status` tells what runs DELTA-TTS.
     """
 
     def __init__(self, backbone_dir: str, checkpoint: str, device: str | None = None,
                  audio_processor: "AudioProcessor | None" = None, compute: str = "exact",
                  fast_dtype: torch.dtype = torch.float16, coreml_model: str | None = None) -> None:
-        if compute not in ("exact", "fast"):
-            raise ValueError(f"compute must be 'exact' or 'fast', got {compute!r}")
+        _check_compute(compute)
         self.device = torch.device(device or default_device())
         self.model = DeltaTTS(backbone_dir).to(self.device).float().eval()
         self.model.load_checkpoint(checkpoint)
         self.model.merge_lora()
-        self.forward = self.model if compute == "exact" else self._fast_forward(checkpoint, coreml_model, fast_dtype)
+        self._fast_options = (checkpoint, coreml_model, fast_dtype)
+        self._fast: FallbackForward | None = None  # built on the first switch to "fast", then kept
+        self.forward: DeltaTTS | FallbackForward = self.model
+        self._compute = "exact"
+        self.set_compute(compute)
         with warnings.catch_warnings():
             # The CosyVoice config imports pyworld, which imports pkg_resources; setuptools 80
             # (used on macOS) warns about that import.
@@ -183,6 +188,37 @@ class DeltaTTSPipeline:
     def clear_prompt_cache(self) -> None:
         """Forget all cached prompts (features, speaker embeddings and processed audio)."""
         self._prompt_cache.clear()
+
+    @property
+    def compute(self) -> str:
+        """The compute mode, "exact" or "fast" (see `set_compute`)."""
+        return self._compute
+
+    def set_compute(self, mode: str) -> None:
+        """Switch DELTA-TTS between "exact" (float32) and "fast".
+
+        The fast backend is built on the first switch to "fast" and kept for later switches. The
+        switch returns at once: the Neural Engine buckets load in the background, and until its
+        bucket is ready an utterance runs in float32 (`backend_status` shows the progress). Not
+        safe during a `synthesize` call: the caller serializes the two.
+        """
+        _check_compute(mode)
+        if mode == "fast" and self._fast is None:
+            self._fast = self._fast_forward(*self._fast_options)
+        self.forward = self._fast if mode == "fast" and self._fast is not None else self.model
+        self._compute = mode
+
+    def backend_status(self) -> dict:
+        """What runs DELTA-TTS now, for display; a snapshot that never waits for a compilation.
+
+        Returns:
+            {"backend": "float32", "state": "ready"} in the exact mode; in the fast mode
+            `ReducedPrecisionForward.status()` ({"backend": "float16", "state": "ready"}) or
+            `CoreMLForward.status()` (backend "neural_engine", with its loading progress).
+        """
+        if isinstance(self.forward, FallbackForward):
+            return self.forward.status()
+        return {"backend": "float32", "state": "ready"}
 
     def _fast_forward(self, checkpoint: str, coreml_model: str | None, fast_dtype: torch.dtype) -> FallbackForward:
         """The fast mode: the Neural Engine on MPS when an exported Core ML model and coremltools
@@ -332,6 +368,11 @@ class _HiFTFloat32:
         source = source.transpose(1, 2)
         mel = speech_feat if finalize else speech_feat[:, :, :-hift.f0_predictor.condnet[0].causal_padding]
         return hift.decode(x=mel, s=source, finalize=finalize), source
+
+
+def _check_compute(mode: str) -> None:
+    if mode not in ("exact", "fast"):
+        raise ValueError(f"compute must be 'exact' or 'fast', got {mode!r}")
 
 
 def _no_progress(stage: str, step: int, total: int) -> None:
