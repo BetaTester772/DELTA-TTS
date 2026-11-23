@@ -38,6 +38,7 @@ import math
 import os
 import shutil
 import signal
+import stat
 import sys
 import tempfile
 import threading
@@ -164,8 +165,42 @@ def audio_info(path: Path) -> tuple[float, int]:
     return info.frames / info.samplerate, int(info.samplerate)
 
 
+UPLOAD_DIR_PREFIX = "delta_tts_demo_uploads_"
+
+
+def _remove_stale_upload_dirs() -> None:
+    """Remove upload directories left by servers that did not exit cleanly (e.g. SIGKILL).
+
+    They sit in the per-user temporary directory, which macOS clears only of files unused for
+    3 days. A directory is removed only if its name carries the PID of a process that no longer
+    exists, it belongs to this user and it is not a symlink; when in doubt it is left alone.
+    """
+    for path in Path(tempfile.gettempdir()).glob(f"{UPLOAD_DIR_PREFIX}*"):
+        pid = path.name.removeprefix(UPLOAD_DIR_PREFIX).split("_", 1)[0]
+        if not pid.isdigit() or _pid_alive(int(pid)):
+            continue
+        try:
+            st = os.lstat(path)
+        except OSError:
+            continue
+        if stat.S_ISDIR(st.st_mode) and st.st_uid == os.getuid():
+            shutil.rmtree(path, ignore_errors=True)
+            logger.info("Removed the upload directory of an earlier server (PID %s)", pid)
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:  # exists, owned by someone else
+        return True
+    return True
+
+
 class UploadStore:
-    """Uploaded prompts in a private temporary directory, removed by `close`.
+    """Uploaded prompts in a private temporary directory, removed by `close` (or, after an
+    unclean exit, by the next server's startup).
 
     Each file is named by its content hash, so that a repeated upload maps to the same path and
     hits the pipeline's prompt cache (keyed by path, mtime and size). The store keeps at most
@@ -174,7 +209,9 @@ class UploadStore:
     """
 
     def __init__(self, max_files: int = MAX_UPLOAD_FILES, max_bytes: int = MAX_UPLOAD_DIR_BYTES) -> None:
-        self.dir = Path(tempfile.mkdtemp(prefix="delta_tts_demo_uploads_")).resolve()  # mode 0700
+        _remove_stale_upload_dirs()
+        # mode 0700; the PID in the name lets a later server remove it if this one dies uncleanly
+        self.dir = Path(tempfile.mkdtemp(prefix=f"{UPLOAD_DIR_PREFIX}{os.getpid()}_")).resolve()
         self.max_files = max_files
         self.max_bytes = max_bytes
         self._files: OrderedDict[Path, int] = OrderedDict()  # path -> size, least recently used first
