@@ -5,11 +5,13 @@
 # files models/{generator_SEMamba_time_d4, mamba_block2_SEMamba, codec_module_time_d4, stfts}.py
 # and the enhancement step of inference.py. The network is unchanged and loads the released
 # weights as is. The only difference is `Mamba`: the original imports it from mamba-ssm, whose
-# kernels need CUDA, so it is re-implemented here in plain PyTorch (runs on CUDA, MPS and CPU).
+# kernels need CUDA, so it is re-implemented here in plain PyTorch (runs on CUDA, MPS and CPU),
+# with fused Metal kernels on MPS.
 """RE-USE universal speech enhancement (9.6M parameters, 8-48 kHz input).
 
 What this file contains
-    Mamba            pure-PyTorch Mamba (selective state space) layer, weight-compatible with mamba-ssm
+    Mamba            Mamba (selective state space) layer, weight-compatible with mamba-ssm: plain
+                     PyTorch, with fused Metal kernels on MPS
     SEMamba          the RE-USE network: dense encoder, 30 time-frequency Mamba blocks, decoders
     ReUSE            loads the released checkpoint and enhances a waveform at its own sample rate
 """
@@ -62,6 +64,8 @@ class Mamba(nn.Module):
         Returns:
             Shape: (batch, seq_len, d_model)
         """
+        if hidden_states.device.type == "mps" and hidden_states.dtype == torch.float32 and hasattr(torch.mps, "compile_shader"):
+            return self._forward_metal(hidden_states)
         seq_len = hidden_states.shape[1]
         x, z = self.in_proj(hidden_states).chunk(2, dim=-1)  # (batch, seq_len, d_inner) each
         x = self.conv1d(x.transpose(1, 2))[..., :seq_len].transpose(1, 2)  # causal convolution
@@ -74,10 +78,32 @@ class Mamba(nn.Module):
         y = y * F.silu(z)
         return self.out_proj(y)  # (batch, seq_len, d_model)
 
+    def _forward_metal(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """`forward` on MPS: the per-channel steps between the projections run as two Metal kernels,
+        which read the projection outputs in place, without transposes or intermediate tensors."""
+        batch, seq_len, _ = hidden_states.shape
+        library = _mamba_library(self.d_state, self.conv1d.kernel_size[0])
+        threads = batch * self.d_inner
+        xz = self.in_proj(hidden_states).contiguous()  # (batch, seq_len, 2 * d_inner): [x | z]
+        u = torch.empty(batch, seq_len, self.d_inner, device=xz.device)  # silu(causal_conv(x))
+        library.causal_conv_silu(xz, self.conv1d.weight.reshape(self.d_inner, -1).contiguous(),
+                                 self.conv1d.bias.contiguous(), u, seq_len, self.d_inner, threads=threads)
+        x_dbl = self.x_proj(u).contiguous()  # (batch, seq_len, dt_rank + 2 * d_state): [dt | B | C]
+        dt = self.dt_proj(x_dbl[..., :self.dt_rank]).contiguous()  # before softplus
+        A = -torch.exp(self.A_log.float()).contiguous()  # (d_inner, d_state)
+        y = torch.empty_like(u)  # (scan + D u) * silu(z)
+        library.selective_scan(u, dt, A, x_dbl, self.D.float().contiguous(), xz, y,
+                               seq_len, self.d_inner, self.dt_rank, threads=threads)
+        return self.out_proj(y)  # (batch, seq_len, d_model)
+
 
 def selective_scan(u: torch.Tensor, delta: torch.Tensor, A: torch.Tensor, B: torch.Tensor, C: torch.Tensor) -> torch.Tensor:
     """Selective scan h_t = exp(delta_t A) h_{t-1} + delta_t B_t u_t, y_t = C_t h_t (the
-    `selective_scan_fn` of mamba-ssm without D, z and delta_bias, which `Mamba` applies itself).
+    `selective_scan_fn` of mamba-ssm without D, z and delta_bias, which `Mamba` applies itself),
+    in plain PyTorch (any device).
+
+    The recurrence runs step by step; the per-step terms are precomputed for a block of steps at
+    a time, sized to keep each (batch, steps, d_inner, d_state) tensor around 32M elements.
 
     Args:
         u: Input. Shape: (batch, seq_len, d_inner)
@@ -87,71 +113,6 @@ def selective_scan(u: torch.Tensor, delta: torch.Tensor, A: torch.Tensor, B: tor
         C: Output matrix. Shape: (batch, seq_len, d_state)
     Returns:
         y. Shape: (batch, seq_len, d_inner)
-    """
-    if u.device.type == "mps" and hasattr(torch.mps, "compile_shader"):
-        return _selective_scan_metal(u, delta, A, B, C)
-    return _selective_scan_torch(u, delta, A, B, C)
-
-
-# One thread per (batch, channel) keeps its d_state states in registers and walks the sequence,
-# so the (batch, seq_len, d_inner, d_state) states are never written to memory.
-_SCAN_SHADER = """
-#include <metal_stdlib>
-using namespace metal;
-kernel void selective_scan(
-    device const float* u     [[buffer(0)]],  // (batch, seq_len, d_inner)
-    device const float* delta [[buffer(1)]],  // (batch, seq_len, d_inner)
-    device const float* A     [[buffer(2)]],  // (d_inner, D_STATE)
-    device const float* B     [[buffer(3)]],  // (batch, seq_len, D_STATE)
-    device const float* C     [[buffer(4)]],  // (batch, seq_len, D_STATE)
-    device float* y           [[buffer(5)]],  // (batch, seq_len, d_inner)
-    constant uint& seq_len    [[buffer(6)]],
-    constant uint& d_inner    [[buffer(7)]],
-    uint idx [[thread_position_in_grid]])
-{
-    const uint b = idx / d_inner;
-    const uint d = idx % d_inner;
-    float a[D_STATE];
-    float h[D_STATE];
-    for (uint n = 0; n < D_STATE; ++n) {
-        a[n] = A[d * D_STATE + n];
-        h[n] = 0.0f;
-    }
-    for (uint t = 0; t < seq_len; ++t) {
-        const uint row = b * seq_len + t;
-        const float dt = delta[row * d_inner + d];
-        const float dt_u = dt * u[row * d_inner + d];
-        float acc = 0.0f;
-        for (uint n = 0; n < D_STATE; ++n) {
-            h[n] = precise::exp(dt * a[n]) * h[n] + dt_u * B[row * D_STATE + n];
-            acc += h[n] * C[row * D_STATE + n];
-        }
-        y[row * d_inner + d] = acc;
-    }
-}
-"""
-_metal_libraries: dict[int, Any] = {}
-
-
-def _selective_scan_metal(u: torch.Tensor, delta: torch.Tensor, A: torch.Tensor, B: torch.Tensor, C: torch.Tensor) -> torch.Tensor:
-    """`selective_scan` as a Metal kernel. All inputs float32 on MPS."""
-    batch, seq_len, d_inner = u.shape
-    d_state = A.shape[1]
-    if d_state not in _metal_libraries:
-        _metal_libraries[d_state] = torch.mps.compile_shader(_SCAN_SHADER.replace("D_STATE", str(d_state)))
-    y = torch.empty(batch, seq_len, d_inner, dtype=torch.float32, device=u.device)
-    _metal_libraries[d_state].selective_scan(
-        u.float().contiguous(), delta.float().contiguous(), A.float().contiguous(),
-        B.float().contiguous(), C.float().contiguous(), y, seq_len, d_inner, threads=batch * d_inner,
-    )
-    return y.to(u.dtype)
-
-
-def _selective_scan_torch(u: torch.Tensor, delta: torch.Tensor, A: torch.Tensor, B: torch.Tensor, C: torch.Tensor) -> torch.Tensor:
-    """`selective_scan` in plain PyTorch (any device).
-
-    The recurrence runs step by step; the per-step terms are precomputed for a block of steps at
-    a time, sized to keep each (batch, steps, d_inner, d_state) tensor around 32M elements.
     """
     batch, seq_len, d_inner = u.shape
     d_state = A.shape[1]
@@ -169,6 +130,100 @@ def _selective_scan_torch(u: torch.Tensor, delta: torch.Tensor, A: torch.Tensor,
             hs.append(h)
         ys.append(torch.einsum("bsdn,bsn->bsd", torch.stack(hs, dim=1), C[:, start:stop]))
     return torch.cat(ys, dim=1)
+
+
+# One thread per (batch, channel) walks the sequence with its convolution window and its d_state
+# states in registers, so neither the (batch, seq_len, d_inner, d_state) states nor the
+# intermediate per-channel tensors are written to memory. Rows are (batch, time) pairs.
+_MAMBA_SHADER = """
+#include <metal_stdlib>
+using namespace metal;
+
+// u = silu(bias + causal depth-wise convolution of x), x = first half of xz
+kernel void causal_conv_silu(
+    device const float* xz    [[buffer(0)]],  // (rows, 2 * d_inner): [x | z]
+    device const float* w     [[buffer(1)]],  // (d_inner, D_CONV)
+    device const float* bias  [[buffer(2)]],  // (d_inner)
+    device float* u           [[buffer(3)]],  // (rows, d_inner)
+    constant uint& seq_len    [[buffer(4)]],
+    constant uint& d_inner    [[buffer(5)]],
+    uint idx [[thread_position_in_grid]])
+{
+    const uint b = idx / d_inner;
+    const uint d = idx % d_inner;
+    float k[D_CONV];
+    float window[D_CONV];  // window[D_CONV - 1] is x_t, window[0] is x_{t - D_CONV + 1}
+    for (uint i = 0; i < D_CONV; ++i) {
+        k[i] = w[d * D_CONV + i];
+        window[i] = 0.0f;
+    }
+    for (uint t = 0; t < seq_len; ++t) {
+        const uint row = b * seq_len + t;
+        for (uint i = 0; i + 1 < D_CONV; ++i) {
+            window[i] = window[i + 1];
+        }
+        window[D_CONV - 1] = xz[row * 2 * d_inner + d];
+        float acc = bias[d];
+        for (uint i = 0; i < D_CONV; ++i) {
+            acc += k[i] * window[i];
+        }
+        u[row * d_inner + d] = acc / (1.0f + precise::exp(-acc));
+    }
+}
+
+// y = (C_t h_t + D u_t) * silu(z_t), h_t = exp(dt_t A) h_{t-1} + dt_t B_t u_t, dt_t = softplus(dt_raw_t)
+kernel void selective_scan(
+    device const float* u      [[buffer(0)]],  // (rows, d_inner)
+    device const float* dt_raw [[buffer(1)]],  // (rows, d_inner), before softplus
+    device const float* A      [[buffer(2)]],  // (d_inner, D_STATE)
+    device const float* x_dbl  [[buffer(3)]],  // (rows, dt_rank + 2 * D_STATE): [dt | B | C]
+    device const float* Dskip  [[buffer(4)]],  // (d_inner)
+    device const float* xz     [[buffer(5)]],  // (rows, 2 * d_inner): [x | z]
+    device float* y            [[buffer(6)]],  // (rows, d_inner)
+    constant uint& seq_len     [[buffer(7)]],
+    constant uint& d_inner     [[buffer(8)]],
+    constant uint& dt_rank     [[buffer(9)]],
+    uint idx [[thread_position_in_grid]])
+{
+    const uint b = idx / d_inner;
+    const uint d = idx % d_inner;
+    const uint width = dt_rank + 2 * D_STATE;
+    float a[D_STATE];
+    float h[D_STATE];
+    for (uint n = 0; n < D_STATE; ++n) {
+        a[n] = A[d * D_STATE + n];
+        h[n] = 0.0f;
+    }
+    const float skip = Dskip[d];
+    for (uint t = 0; t < seq_len; ++t) {
+        const uint row = b * seq_len + t;
+        const float raw = dt_raw[row * d_inner + d];
+        // softplus as in torch (threshold 20); exp(raw) where log(1 + exp(raw)) would lose precision
+        const float dt = raw > 20.0f ? raw : (raw < -15.0f ? precise::exp(raw) : precise::log(1.0f + precise::exp(raw)));
+        const float ut = u[row * d_inner + d];
+        const float dt_u = dt * ut;
+        device const float* Bt = x_dbl + row * width + dt_rank;
+        device const float* Ct = Bt + D_STATE;
+        float acc = 0.0f;
+        for (uint n = 0; n < D_STATE; ++n) {
+            h[n] = precise::exp(dt * a[n]) * h[n] + dt_u * Bt[n];
+            acc += h[n] * Ct[n];
+        }
+        const float z = xz[row * 2 * d_inner + d_inner + d];
+        y[row * d_inner + d] = (acc + skip * ut) * (z / (1.0f + precise::exp(-z)));
+    }
+}
+"""
+_metal_libraries: dict[tuple[int, int], Any] = {}
+
+
+def _mamba_library(d_state: int, d_conv: int) -> Any:
+    """The compiled Metal kernels for a (d_state, d_conv) configuration."""
+    key = (d_state, d_conv)
+    if key not in _metal_libraries:
+        source = _MAMBA_SHADER.replace("D_STATE", str(d_state)).replace("D_CONV", str(d_conv))
+        _metal_libraries[key] = torch.mps.compile_shader(source)
+    return _metal_libraries[key]
 
 
 # -----------------------------
