@@ -487,6 +487,9 @@ class _BucketLoader:
         """Load `bucket` in the helper process, which compiles it into the cache if needed.
         Returns the helper's load time in seconds."""
         if self._helper is None or self._helper.poll() is not None:
+            # Hugging Face tokenizers (used by the CosyVoice frontend) warn on every fork once they
+            # have run in parallel; the helper does not tokenize, so their parallelism can go.
+            os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
             self._helper = subprocess.Popen([sys.executable, "-c", _HELPER, self.path], stdin=subprocess.PIPE,
                                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
         assert self._helper.stdin is not None and self._helper.stdout is not None

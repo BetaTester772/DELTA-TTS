@@ -58,3 +58,16 @@ def test_init_goes_through_set_compute(monkeypatch: pytest.MonkeyPatch) -> None:
     with pytest.raises(ValueError, match="compute"):
         tts.set_compute("quick")
     assert tts.compute == "fast"
+
+
+def test_prewarm_builds_the_fast_backend_without_switching(tts: DeltaTTSPipeline) -> None:
+    assert tts.backend_status("fast") == {"backend": None, "state": "not_started"}
+    tts.prewarm_fast()
+    assert tts.compute == "exact" and tts.forward is tts.model
+    assert tts.backend_status() == {"backend": "float32", "state": "ready"}
+    assert tts.backend_status("fast") == {"backend": "float16", "state": "ready"}
+    prewarmed = tts._fast
+    tts.set_compute("fast")
+    assert tts.forward is prewarmed  # the switch reuses the prewarmed backend
+    with pytest.raises(ValueError, match="compute"):
+        tts.backend_status("quick")

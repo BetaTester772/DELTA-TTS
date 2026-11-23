@@ -203,22 +203,35 @@ class DeltaTTSPipeline:
         safe during a `synthesize` call: the caller serializes the two.
         """
         _check_compute(mode)
-        if mode == "fast" and self._fast is None:
-            self._fast = self._fast_forward(*self._fast_options)
+        if mode == "fast":
+            self.prewarm_fast()
         self.forward = self._fast if mode == "fast" and self._fast is not None else self.model
         self._compute = mode
 
-    def backend_status(self) -> dict:
-        """What runs DELTA-TTS now, for display; a snapshot that never waits for a compilation.
+    def prewarm_fast(self) -> None:
+        """Build the fast backend without switching to it, so that its Neural Engine buckets load
+        (and fill the macOS compilation cache) in the background while the current mode keeps
+        running. A later `set_compute("fast")` then reuses it. Returns at once."""
+        if self._fast is None:
+            self._fast = self._fast_forward(*self._fast_options)
+
+    def backend_status(self, mode: str | None = None) -> dict:
+        """What runs DELTA-TTS in `mode` (default: the current mode), for display; a snapshot that
+        never waits for a compilation.
 
         Returns:
-            {"backend": "float32", "state": "ready"} in the exact mode; in the fast mode
-            `ReducedPrecisionForward.status()` ({"backend": "float16", "state": "ready"}) or
-            `CoreMLForward.status()` (backend "neural_engine", with its loading progress).
+            {"backend": "float32", "state": "ready"} for "exact". For "fast":
+            `ReducedPrecisionForward.status()` ({"backend": "float16", "state": "ready"}),
+            `CoreMLForward.status()` (backend "neural_engine", with its loading progress), or
+            {"backend": None, "state": "not_started"} before the fast backend is built.
         """
-        if isinstance(self.forward, FallbackForward):
-            return self.forward.status()
-        return {"backend": "float32", "state": "ready"}
+        mode = mode or self._compute
+        _check_compute(mode)
+        if mode == "exact":
+            return {"backend": "float32", "state": "ready"}
+        if self._fast is None:
+            return {"backend": None, "state": "not_started"}
+        return self._fast.status()
 
     def _fast_forward(self, checkpoint: str, coreml_model: str | None, fast_dtype: torch.dtype) -> FallbackForward:
         """The fast mode: the Neural Engine on MPS when an exported Core ML model and coremltools
