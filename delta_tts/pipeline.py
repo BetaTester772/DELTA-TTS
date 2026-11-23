@@ -19,10 +19,13 @@ import sys
 import uuid
 import warnings
 from collections import OrderedDict
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import torch
+import torchaudio
 
 from delta_tts.duration import estimate_speech_len
 from delta_tts.generate import generate
@@ -46,6 +49,10 @@ logger = logging.getLogger(__name__)
 INSTRUCT_TOKENS = [2610, 525, 264, 10950, 17847, 13, 151646]
 
 PROMPT_CACHE_SIZE = 16  # prompts whose features are kept
+
+# progress(stage, step, total), see `DeltaTTSPipeline.synthesize`
+Progress = Callable[[str, int, int], None]
+ACOUSTIC_STEPS = 10  # Euler steps of the CosyVoice 3 flow decoder (n_timesteps in its flow.inference)
 
 
 def default_device() -> str:
@@ -94,7 +101,7 @@ class DeltaTTSPipeline:
 
     @torch.no_grad()
     def synthesize(self, text: str, prompt_wav: str, prompt_text: str, speech_len: int | None = None,
-                   length_scale: float = 1.0, **decoding) -> torch.Tensor:
+                   length_scale: float = 1.0, progress: Progress | None = None, **decoding) -> torch.Tensor:
         """Synthesize `text` in the voice of `prompt_wav`.
 
         Args:
@@ -105,6 +112,11 @@ class DeltaTTSPipeline:
                 prompt when None.
             length_scale: Factor on the estimated length (above 1: slower speech). Ignored when
                 `speech_len` is given.
+            progress: Called as progress(stage, step, total) as synthesis advances:
+                "prompt" (0, 1) and (1, 1) when the prompt is processed (not when it is cached),
+                "tokens" after each DELTA-TTS forward pass, "acoustic" after each flow-matching
+                step and "vocoder" (0, 1) and (1, 1). The device is synchronized at each step, so
+                the steps follow the actual computation; the output does not change.
             **decoding: Overrides for `delta_tts.generate.generate` (num_steps, top_p, ...).
         Returns:
             Waveform at `self.sample_rate`. Shape: (1, num_samples)
@@ -114,7 +126,8 @@ class DeltaTTSPipeline:
         # -----------------------------
         # 1. CosyVoice 3 frontend
         # -----------------------------
-        prompt = self._prompt(prompt_wav, prompt_text)
+        report = progress or _no_progress
+        prompt = self._prompt(prompt_wav, prompt_text, report)
         target_text_token, _ = frontend._extract_text_token(frontend.text_normalize(text, split=False, text_frontend=True))
         # Text sequence: [instruction] [prompt transcript] [target text]
         target_text_token = target_text_token.to(self.device)  # (1, target_text_len)
@@ -136,17 +149,38 @@ class DeltaTTSPipeline:
         # -----------------------------
         if isinstance(self.forward, ReducedPrecisionForward):
             self.forward.reset()
-        speech_token = generate(self.forward, text_token, prompt_speech_token, speech_len, **decoding)  # (1, speech_len)
+        speech_token = generate(self.forward, text_token, prompt_speech_token, speech_len,
+                                progress=(lambda step, total: report("tokens", step, total)) if progress else None,
+                                **decoding)  # (1, speech_len)
 
         # -----------------------------
         # 4. CosyVoice 3 flow decoder and vocoder
         # -----------------------------
-        wav = self._token2wav(speech_token, prompt)
+        if progress is None:
+            wav = self._token2wav(speech_token, prompt)
+        else:
+            with self._reporting_decoder(report):
+                wav = self._token2wav(speech_token, prompt)
         if self.audio_processor is not None:
             wav = self.audio_processor.process_output(wav, self.sample_rate)
         return wav
 
-    def _prompt(self, prompt_wav: str, prompt_text: str) -> dict:
+    def prepare_prompt(self, prompt_wav: str, prompt_text: str) -> tuple[torch.Tensor, int]:
+        """Process the prompt now (the `AudioProcessor`'s enhancement and trimming, if any, and
+        the CosyVoice 3 frontend), so that a later `synthesize` with the same prompt file and
+        transcript skips this work.
+
+        Returns:
+            The prompt audio the model uses, i.e. after processing, and its sample rate.
+            Shape: (1, num_samples)
+        """
+        return self._prompt(prompt_wav, prompt_text)["audio"]
+
+    def clear_prompt_cache(self) -> None:
+        """Forget all cached prompts (features, speaker embeddings and processed audio)."""
+        self._prompt_cache.clear()
+
+    def _prompt(self, prompt_wav: str, prompt_text: str, report: Progress | None = None) -> dict:
         """Prompt features, from the cache when the same prompt file and transcript were seen.
 
         With an `AudioProcessor`, the features are those of the processed prompt.
@@ -156,11 +190,16 @@ class DeltaTTSPipeline:
         if key in self._prompt_cache:
             self._prompt_cache.move_to_end(key)
             return self._prompt_cache[key]
+        report = report or _no_progress
+        report("prompt", 0, 1)
         if self.audio_processor is None:
             prompt = self._extract_prompt(prompt_wav, prompt_text)
+            prompt["audio"] = _load_mono(prompt_wav)
         else:
             with self.audio_processor.prepare_prompt(prompt_wav) as processed_prompt_wav:
                 prompt = self._extract_prompt(processed_prompt_wav, prompt_text)
+                prompt["audio"] = _load_mono(processed_prompt_wav)
+        report("prompt", 1, 1)
         self._prompt_cache[key] = prompt
         if len(self._prompt_cache) > PROMPT_CACHE_SIZE:
             self._prompt_cache.popitem(last=False)
@@ -189,6 +228,41 @@ class DeltaTTSPipeline:
         embedding = frontend._extract_spk_embedding(prompt_wav)
         return {"text_token": text_token, "speech_token": speech_token, "speech_feat": speech_feat,
                 "embedding": embedding.reshape(1, -1), "untrimmed_speech_len": untrimmed_speech_len}
+
+    @contextmanager
+    def _reporting_decoder(self, report: Progress) -> Iterator[None]:
+        """Report the flow-matching steps and the vocoder while `_token2wav` runs.
+
+        Wraps the flow decoder's per-step estimator call and the vocoder for the duration of the
+        block. Each step synchronizes the device: otherwise the queued GPU work would let the
+        reported steps run ahead of the computation.
+        """
+        model = self.cosyvoice.model
+        decoder = model.flow.decoder
+        estimate, vocode = decoder.forward_estimator, model.hift.inference
+        steps = 0
+
+        def estimate_and_report(*args, **kwargs):
+            nonlocal steps
+            out = estimate(*args, **kwargs)
+            _synchronize(self.device)
+            steps += 1
+            report("acoustic", min(steps, ACOUSTIC_STEPS), ACOUSTIC_STEPS)
+            return out
+
+        def vocode_and_report(*args, **kwargs):
+            report("vocoder", 0, 1)
+            out = vocode(*args, **kwargs)
+            report("vocoder", 1, 1)
+            return out
+
+        decoder.forward_estimator = estimate_and_report
+        model.hift.inference = vocode_and_report
+        try:
+            yield
+        finally:
+            del decoder.forward_estimator  # back to the class method
+            del model.hift.inference
 
     def _token2wav(self, speech_token: torch.Tensor, prompt: dict) -> torch.Tensor:
         """Decode speech tokens to a waveform with the prompt as acoustic reference.
@@ -237,6 +311,23 @@ class _HiFTFloat32:
         source = source.transpose(1, 2)
         mel = speech_feat if finalize else speech_feat[:, :, :-hift.f0_predictor.condnet[0].causal_padding]
         return hift.decode(x=mel, s=source, finalize=finalize), source
+
+
+def _no_progress(stage: str, step: int, total: int) -> None:
+    pass
+
+
+def _synchronize(device: torch.device) -> None:
+    if device.type == "mps":
+        torch.mps.synchronize()
+    elif device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+
+def _load_mono(path: str) -> tuple[torch.Tensor, int]:
+    """Audio file as a mono float waveform. Shape: (1, num_samples)"""
+    wav, sample_rate = torchaudio.load(path)
+    return wav.mean(dim=0, keepdim=True), sample_rate
 
 
 def _move_decoder_to_mps(model, device: torch.device) -> None:

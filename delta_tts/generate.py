@@ -15,6 +15,7 @@ How generation works
     when little context is available, and more positions in later steps.
 """
 
+from collections.abc import Callable
 from typing import Protocol
 
 import torch
@@ -43,6 +44,7 @@ def generate(
     top_p: float = 0.8,
     t_shift: float = 0.3,
     temperature: float = 0.0,
+    progress: Callable[[int, int], None] | None = None,
 ) -> torch.Tensor:
     """Generate `speech_len` speech tokens by iterative unmasking.
 
@@ -55,6 +57,7 @@ def generate(
         top_p: Nucleus filtering applied before computing confidences.
         t_shift: Time shift of the unmasking schedule; below 1 commits fewer positions early.
         temperature: 0 takes the most likely token at each position; above 0 samples.
+        progress: Called as progress(step, total) after each forward pass of the schedule.
     Returns:
         Generated speech tokens. Shape: (1, speech_len)
     """
@@ -75,7 +78,9 @@ def generate(
     # the logits for the target therefore start one position before the target.
     logit_start = 1 + text_token.shape[1] + 1 + prompt_len - 1
 
-    for n_commit in unmask_schedule(speech_len, num_steps, t_shift):
+    schedule = unmask_schedule(speech_len, num_steps, t_shift)
+    total_passes, passes = sum(1 for n in schedule if n > 0), 0
+    for n_commit in schedule:
         if n_commit == 0 or not is_masked.any():
             continue
 
@@ -83,6 +88,9 @@ def generate(
         # 1. Predict every masked position in parallel
         # -----------------------------
         logits = model.logits(text_token, speech_tokens)  # (1, seq_len, vocab_size)
+        passes += 1
+        if progress is not None:
+            progress(passes, total_passes)
         logits = logits[0, logit_start:logit_start + speech_len]  # (speech_len, vocab_size)
         logits[:, SPEECH_TOKEN_SIZE:] = float("-inf")  # only speech tokens can be generated
         if temperature > 0:
@@ -137,6 +145,8 @@ def generate(
         remaining_logits[:, SPEECH_TOKEN_SIZE:] = float("-inf")
         speech_tokens[0, prompt_len + remaining] = remaining_logits.argmax(dim=-1)
 
+    if progress is not None and passes < total_passes:  # every position was committed early
+        progress(total_passes, total_passes)
     return speech_tokens[:, target]  # (1, speech_len)
 
 
