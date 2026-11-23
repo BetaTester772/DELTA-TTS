@@ -24,6 +24,16 @@ uv sync
 
 FFmpeg must be installed on the system, since torchaudio reads and writes audio through it (e.g. `apt install ffmpeg`).
 
+**macOS (Apple Silicon).** Install the `mac` extra, which replaces `onnxruntime-gpu` (no macOS build) with `onnxruntime`, and FFmpeg from Homebrew:
+
+```bash
+brew install ffmpeg
+uv sync --extra mac
+```
+
+DELTA-TTS and the CosyVoice 3 flow decoder then run on MPS; the vocoder, whose F0 predictor needs float64, and the ONNX frontend run on the CPU.
+`--device` defaults to CUDA, then MPS, then CPU.
+
 ## Checkpoints
 
 | Model | Backbone | Trainable modules | Training data | Download |

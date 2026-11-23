@@ -1,5 +1,5 @@
 version = 1
-revision = 2
+revision = 3
 requires-python = "==3.11.*"
 
 [[package]]
@@ -337,7 +337,7 @@ dependencies = [
     { name = "modelscope" },
     { name = "numpy" },
     { name = "omegaconf" },
-    { name = "onnxruntime-gpu" },
+    { name = "onnxruntime-gpu", marker = "sys_platform != 'darwin'" },
     { name = "openai-whisper" },
     { name = "peft" },
     { name = "pyarrow" },
@@ -356,6 +356,11 @@ dependencies = [
     { name = "x-transformers" },
 ]
 
+[package.optional-dependencies]
+mac = [
+    { name = "onnxruntime", marker = "sys_platform == 'darwin'" },
+]
+
 [package.metadata]
 requires-dist = [
     { name = "conformer", specifier = "==0.3.2" },
@@ -372,7 +377,8 @@ requires-dist = [
     { name = "modelscope", specifier = "==1.35.1" },
     { name = "numpy", specifier = "==2.4.3" },
     { name = "omegaconf", specifier = "==2.3.0" },
-    { name = "onnxruntime-gpu", specifier = "==1.24.4" },
+    { name = "onnxruntime", marker = "sys_platform == 'darwin' and extra == 'mac'", specifier = "==1.24.4" },
+    { name = "onnxruntime-gpu", marker = "sys_platform != 'darwin'", specifier = "==1.24.4" },
     { name = "openai-whisper", specifier = "==20250625" },
     { name = "peft", specifier = "==0.18.1" },
     { name = "pyarrow", specifier = "==23.0.1" },
@@ -390,6 +396,7 @@ requires-dist = [
     { name = "wget" },
     { name = "x-transformers", specifier = "==2.17.7" },
 ]
+provides-extras = ["mac"]
 
 [[package]]
 name = "diffusers"
@@ -1215,6 +1222,21 @@ wheels = [
 ]
 
 [[package]]
+name = "onnxruntime"
+version = "1.24.4"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "flatbuffers" },
+    { name = "numpy" },
+    { name = "packaging" },
+    { name = "protobuf" },
+    { name = "sympy" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/60/69/6c40720201012c6af9aa7d4ecdd620e521bd806dc6269d636fdd5c5aeebe/onnxruntime-1.24.4-cp311-cp311-macosx_14_0_arm64.whl", hash = "sha256:0bdfce8e9a6497cec584aab407b71bf697dac5e1b7b7974adc50bf7533bdb3a2", size = 17332131, upload-time = "2026-03-17T22:05:49.005Z" },
+]
+
+[[package]]
 name = "onnxruntime-gpu"
 version = "1.24.4"
 source = { registry = "https://pypi.org/simple" }
@@ -1937,7 +1959,6 @@ name = "triton"
 version = "3.6.0"
 source = { registry = "https://pypi.org/simple" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/0f/2c/96f92f3c60387e14cc45aed49487f3486f89ea27106c1b1376913c62abe4/triton-3.6.0-cp311-cp311-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:49df5ef37379c0c2b5c0012286f80174fcf0e073e5ade1ca9a86c36814553651", size = 176081190, upload-time = "2026-01-20T16:16:00.523Z" },
     { url = "https://files.pythonhosted.org/packages/e0/12/b05ba554d2c623bffa59922b94b0775673de251f468a9609bc9e45de95e9/triton-3.6.0-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:e8e323d608e3a9bfcc2d9efcc90ceefb764a82b99dea12a86d643c72539ad5d3", size = 188214640, upload-time = "2026-01-20T16:00:35.869Z" },
 ]
 

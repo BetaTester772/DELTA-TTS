@@ -36,7 +36,7 @@ def parse_args() -> argparse.Namespace:
     # decoding
     parser.add_argument("--num_steps", type=int, default=16)
     parser.add_argument("--temperature", type=float, default=0.0, help="0 takes the most likely token; above 0 samples")
-    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--device", default=None, help="cuda, mps or cpu; by default CUDA, then MPS, then CPU")
     return parser.parse_args()
 
 

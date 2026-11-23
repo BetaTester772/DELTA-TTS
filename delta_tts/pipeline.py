@@ -26,7 +26,7 @@ sys.path.insert(0, str(COSYVOICE_DIR))
 sys.path.insert(0, str(COSYVOICE_DIR / "third_party" / "Matcha-TTS"))
 from cosyvoice.cli.cosyvoice import CosyVoice3
 
-__all__ = ["DeltaTTSPipeline"]
+__all__ = ["DeltaTTSPipeline", "default_device"]
 
 logger = logging.getLogger(__name__)
 
@@ -35,21 +35,32 @@ logger = logging.getLogger(__name__)
 INSTRUCT_TOKENS = [2610, 525, 264, 10950, 17847, 13, 151646]
 
 
+def default_device() -> str:
+    """CUDA if available, then Apple MPS, then CPU."""
+    if torch.cuda.is_available():
+        return "cuda"
+    if torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
 class DeltaTTSPipeline:
     """Text and prompt audio in, waveform out.
 
     Args:
         backbone_dir: CosyVoice 3 model directory (Fun-CosyVoice3-0.5B-2512).
         checkpoint: Path to the DELTA-TTS checkpoint `delta_tts.pt`.
-        device: Torch device for the DELTA-TTS model.
+        device: Torch device for DELTA-TTS and the CosyVoice 3 decoder. `default_device()` when None.
     """
 
-    def __init__(self, backbone_dir: str, checkpoint: str, device: str = "cuda") -> None:
-        self.device = torch.device(device)
+    def __init__(self, backbone_dir: str, checkpoint: str, device: str | None = None) -> None:
+        self.device = torch.device(device or default_device())
         self.model = DeltaTTS(backbone_dir).to(self.device).float().eval()
         self.model.load_checkpoint(checkpoint)
         self.cosyvoice = CosyVoice3(backbone_dir)
         self.sample_rate = self.cosyvoice.sample_rate  # 24 kHz
+        if self.device.type == "mps":
+            _move_decoder_to_mps(self.cosyvoice.model, self.device)
 
     @torch.no_grad()
     def synthesize(self, text: str, prompt_wav: str, prompt_text: str, speech_len: int | None = None, **decoding) -> torch.Tensor:
@@ -127,3 +138,29 @@ class DeltaTTSPipeline:
         )  # (1, num_samples)
         model.hift_cache_dict.pop(uid, None)
         return wav.cpu()
+
+
+class _HiFTOnCPU:
+    """Runs the CosyVoice 3 vocoder on the CPU while the flow decoder runs on MPS.
+
+    `CausalHiFTGenerator.inference` evaluates its F0 predictor in float64, which MPS does not
+    support. The vocoder is small, so it stays on the CPU and receives the mel from MPS.
+    """
+
+    def __init__(self, hift: torch.nn.Module) -> None:
+        self.hift = hift
+
+    def inference(self, speech_feat: torch.Tensor, finalize: bool = True):
+        return self.hift.inference(speech_feat=speech_feat.cpu(), finalize=finalize)
+
+
+def _move_decoder_to_mps(model, device: torch.device) -> None:
+    """Place the CosyVoice 3 flow decoder on MPS; CosyVoice itself only knows CUDA and CPU.
+
+    Args:
+        model: `CosyVoice3Model`, loaded on the CPU.
+        device: MPS device.
+    """
+    model.device = device
+    model.flow.to(device)
+    model.hift = _HiFTOnCPU(model.hift)
