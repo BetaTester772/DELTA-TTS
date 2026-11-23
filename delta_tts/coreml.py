@@ -455,8 +455,15 @@ class _BucketLoader:
 
     def _load(self, bucket: int) -> Any:
         """Load `bucket` in this process, from the cache the helper filled (holds the GIL)."""
-        import coremltools as ct
-
+        # coremltools warns at import about untested torch and scikit-learn versions, which
+        # matter for conversion only, not for running a compiled model.
+        coremltools_logger = logging.getLogger("coremltools")
+        level = coremltools_logger.level
+        coremltools_logger.setLevel(logging.ERROR)
+        try:
+            import coremltools as ct
+        finally:
+            coremltools_logger.setLevel(level)
         return ct.models.CompiledMLModel(self.path, compute_units=ct.ComputeUnit.CPU_AND_NE, function_name=f"L{bucket}")
 
 
