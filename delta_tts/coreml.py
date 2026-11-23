@@ -74,6 +74,7 @@ BUCKETS = (160, 192, 256, 320, 384, 512, 640)
 TYPICAL_SEQ_LEN = 250  # about 4 s of prompt and 4 s of output; buckets are prepared nearest first
 INPUT_DIM = HIDDEN_DIM + 1  # embedding + real-position channel
 MODEL_NAME = "delta_tts_ane.mlmodelc"
+COMPILING_AFTER = 2.0  # seconds; a bucket loading longer is being compiled (status)
 
 
 def default_path(checkpoint: str) -> str:
@@ -350,6 +351,34 @@ class CoreMLForward(FallbackForward):
         """Block until `buckets` (all by default) are loaded; whether they all are."""
         return self.loader.wait(prewarm_order(self.buckets if buckets is None else buckets), timeout)
 
+    def status(self) -> dict:
+        """Snapshot of the loading, for display. Safe from any thread; it never waits for a load.
+
+        Returns:
+            backend: "neural_engine".
+            state: "ready" (nothing loading or queued, at least one bucket loaded), "loading"
+                (a bucket is being loaded, or buckets are queued), "compiling" (the current
+                bucket has been loading for more than COMPILING_AFTER seconds: it is being
+                compiled, a cached load takes about 0.6 s), "failed" (every bucket failed:
+                all utterances run in float32), or "idle" (nothing loaded or queued; only
+                with prewarm=False, before the first utterance).
+            ready_buckets, total_buckets: Loaded buckets, and buckets of the model.
+            max_ready_len: Longest sequence a loaded bucket holds, or None.
+            failed_buckets: Buckets that failed to load (their utterances run in float32).
+            loading_bucket: The bucket being loaded, or None.
+        """
+        ready, failed, loading, loading_seconds, queued = self.loader.snapshot()
+        if loading is not None:
+            state = "compiling" if loading_seconds > COMPILING_AFTER else "loading"
+        elif queued:
+            state = "loading"
+        elif ready:
+            state = "ready"
+        else:
+            state = "failed" if len(failed) == len(self.buckets) else "idle"
+        return {"backend": "neural_engine", "state": state, "ready_buckets": len(ready), "total_buckets": len(self.buckets),
+                "max_ready_len": max(ready, default=None), "failed_buckets": failed, "loading_bucket": loading}
+
     def _fast_logits(self, text_token: torch.Tensor, speech_token: torch.Tensor) -> torch.Tensor | None:
         if self.in_exact_utterance:
             return None
@@ -391,6 +420,7 @@ class _BucketLoader:
         self._attempts: dict[int, int] = {}
         self._queue = list(queue)
         self._loading: int | None = None
+        self._loading_since = 0.0  # time.monotonic() when the current bucket started loading
         self._cond = threading.Condition()
         self._helper: subprocess.Popen[str] | None = None
         threading.Thread(target=self._run, name="delta-tts-coreml-loader", daemon=True).start()
@@ -406,6 +436,14 @@ class _BucketLoader:
                 self._queue.insert(0, bucket)
                 self._cond.notify_all()
             return None
+
+    def snapshot(self) -> tuple[list[int], list[int], int | None, float, bool]:
+        """Loaded and failed buckets, the bucket being loaded and for how long (s), and whether
+        buckets are queued. Takes the lock only briefly: loads run outside it."""
+        with self._cond:
+            loading, since, queued = self._loading, self._loading_since, bool(self._queue)
+            ready, failed = sorted(self.ready), sorted(self.failed)
+        return ready, failed, loading, (time.monotonic() - since) if loading is not None else 0.0, queued
 
     def wait(self, buckets: list[int], timeout: float | None = None) -> bool:
         """Queue `buckets` (behind the queue) and block until each is loaded or failed."""
@@ -424,6 +462,7 @@ class _BucketLoader:
                     self._stop_helper()
                 self._cond.wait_for(lambda: bool(self._queue))
                 bucket = self._loading = self._queue.pop(0)
+                self._loading_since = time.monotonic()
             start = time.perf_counter()
             function = None
             try:

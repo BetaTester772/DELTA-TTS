@@ -49,6 +49,10 @@ class FallbackForward:
         """Start a new utterance with the fast forward."""
         self.in_fallback = False
 
+    def status(self) -> dict:
+        """What runs the forward, for display: {"backend": "float16" (or "bfloat16"), "state": "ready"}."""
+        return {"backend": self.name, "state": "ready"}
+
     def _fast_logits(self, text_token: torch.Tensor, speech_token: torch.Tensor) -> torch.Tensor | None:
         """Same contract as `DeltaTTS.logits`, or None to run this step in float32."""
         raise NotImplementedError

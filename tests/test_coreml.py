@@ -251,3 +251,39 @@ def test_bucket_failing_twice_runs_in_float32(monkeypatch: pytest.MonkeyPatch) -
     assert not loader.wait([8, 16], timeout=5)
     assert loads == [8, 16, 8] and loader.failed == {8} and loader.get(8) is None
     assert loader._queue == []  # a failed bucket is not queued again
+
+
+def test_status_follows_the_loading(forward: CoreMLForward) -> None:
+    status = forward.status()
+    assert status == {"backend": "neural_engine", "state": "idle", "ready_buckets": 0, "total_buckets": 2,
+                      "max_ready_len": None, "failed_buckets": [], "loading_bucket": None}
+    forward.loader._queue = [16]
+    assert forward.status()["state"] == "loading"
+    forward.loader._queue, forward.loader._loading = [], 16
+    forward.loader._loading_since = coreml.time.monotonic()
+    assert forward.status()["state"] == "loading" and forward.status()["loading_bucket"] == 16
+    forward.loader._loading_since -= coreml.COMPILING_AFTER + 1  # loading for a while: compiling
+    assert forward.status()["state"] == "compiling"
+    forward.loader._loading = None
+    forward.loader.ready[8] = StandInFunction(2.0)
+    forward.loader.failed.add(16)
+    status = forward.status()
+    assert status["state"] == "ready" and status["ready_buckets"] == 1 and status["max_ready_len"] == 8
+    assert status["failed_buckets"] == [16]
+    del forward.loader.ready[8]
+    forward.loader.failed.add(8)
+    assert forward.status()["state"] == "failed"
+
+
+def test_status_does_not_wait_for_a_load(monkeypatch: pytest.MonkeyPatch) -> None:
+    import threading
+
+    release = threading.Event()
+    stand_in_loads(monkeypatch, fail={})
+    monkeypatch.setattr(coreml._BucketLoader, "_load_in_helper", lambda self, bucket: release.wait(5) and 0.0)
+    loader = coreml._BucketLoader("unused", [8])
+    while loader.snapshot()[2] is None:  # until bucket 8 is loading
+        pass
+    assert loader.snapshot()[2] == 8  # answered while the load blocks
+    release.set()
+    assert loader.wait([8], timeout=5)

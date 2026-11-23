@@ -60,3 +60,7 @@ def test_reduced_copy_is_independent() -> None:
     forward = ReducedPrecisionForward(model, torch.float16)
     assert forward.reduced is not model and forward.reduced.scale.dtype == torch.float16
     assert model.scale.dtype == torch.float32
+
+
+def test_status() -> None:
+    assert ReducedPrecisionForward(ScaledLogits(), torch.float16).status() == {"backend": "float16", "state": "ready"}
