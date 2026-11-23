@@ -191,22 +191,33 @@ class DeltaTTSPipeline:
         return wav.cpu()
 
 
-class _HiFTOnCPU:
-    """Runs the CosyVoice 3 vocoder on the CPU while the flow decoder runs on MPS.
+class _HiFTFloat32:
+    """The CosyVoice 3 vocoder with its F0 predictor in float32, so that all of it runs on MPS.
 
-    `CausalHiFTGenerator.inference` evaluates its F0 predictor in float64, which MPS does not
-    support. The vocoder is small, so it stays on the CPU and receives the mel from MPS.
+    `CausalHiFTGenerator.inference` casts the F0 predictor to float64, which MPS does not
+    support. float64 keeps the F0 of consecutive chunks consistent in streaming synthesis; this
+    pipeline vocodes each utterance in one call (finalize=True), where float32 gives the same F0
+    (at most 0.004 Hz apart and no voiced/unvoiced flips on 16 demo utterances). Otherwise the
+    same steps as `CausalHiFTGenerator.inference`.
     """
 
     def __init__(self, hift: torch.nn.Module) -> None:
         self.hift = hift
 
-    def inference(self, speech_feat: torch.Tensor, finalize: bool = True):
-        return self.hift.inference(speech_feat=speech_feat.cpu(), finalize=finalize)
+    @torch.inference_mode()
+    def inference(self, speech_feat: torch.Tensor, finalize: bool = True) -> tuple[torch.Tensor, torch.Tensor]:
+        hift = self.hift
+        f0 = hift.f0_predictor(speech_feat, finalize=finalize)  # mel -> F0
+        source = hift.f0_upsamp(f0[:, None]).transpose(1, 2)  # F0 -> source
+        source, _, _ = hift.m_source(source)
+        source = source.transpose(1, 2)
+        mel = speech_feat if finalize else speech_feat[:, :, :-hift.f0_predictor.condnet[0].causal_padding]
+        return hift.decode(x=mel, s=source, finalize=finalize), source
 
 
 def _move_decoder_to_mps(model, device: torch.device) -> None:
-    """Place the CosyVoice 3 flow decoder on MPS; CosyVoice itself only knows CUDA and CPU.
+    """Place the CosyVoice 3 flow decoder and vocoder on MPS; CosyVoice itself only knows CUDA
+    and CPU.
 
     Args:
         model: `CosyVoice3Model`, loaded on the CPU.
@@ -214,4 +225,10 @@ def _move_decoder_to_mps(model, device: torch.device) -> None:
     """
     model.device = device
     model.flow.to(device)
-    model.hift = _HiFTOnCPU(model.hift)
+    hift = model.hift.to(device)
+    # The vocoder's STFT and inverse STFT (n_fft = 16) are tiny and run on the CPU, since MPS
+    # complex support is partial; the results are the same.
+    stft, istft = type(hift)._stft, type(hift)._istft
+    hift._stft = lambda x: tuple(y.to(x.device) for y in stft(hift, x.cpu()))
+    hift._istft = lambda magnitude, phase: istft(hift, magnitude.cpu(), phase.cpu()).to(magnitude.device)
+    model.hift = _HiFTFloat32(hift)

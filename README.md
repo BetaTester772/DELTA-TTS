@@ -31,7 +31,7 @@ brew install ffmpeg
 uv sync --extra mac
 ```
 
-DELTA-TTS and the CosyVoice 3 flow decoder then run on MPS; the vocoder, whose F0 predictor needs float64, and the ONNX frontend run on the CPU.
+DELTA-TTS and the CosyVoice 3 flow decoder and vocoder then run on MPS, the vocoder's F0 predictor in float32 instead of float64 (MPS has no float64; for whole-utterance synthesis the F0 is the same); the ONNX frontend runs on the CPU.
 `--device` defaults to CUDA, then MPS, then CPU.
 
 **Audio processing (optional).** The `audio` extra adds [Silero VAD](https://github.com/snakers4/silero-vad) and [NVIDIA RE-USE](https://huggingface.co/nvidia/NVIDIA-NemotronLabs-RE-USE) speech enhancement (`uv sync --extra audio`, or `--extra mac --extra audio`).
