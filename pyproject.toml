@@ -5,11 +5,15 @@ description = "DELTA-TTS: Adapting Autoregressive Model into Diffusion Language 
 readme = "README.md"
 license = { text = "Apache-2.0" }
 requires-python = ">=3.11,<3.12"
-# Versions match the environment used for the paper.
+# Versions match the environment used for the paper. On macOS, PyTorch is newer: its MPS
+# backend is faster there (Metal SDPA kernels) and gives the same speech tokens.
 dependencies = [
-    "torch==2.10.0",
-    "torchaudio==2.10.0",
-    "torchcodec==0.10.0",
+    "torch==2.10.0; sys_platform != 'darwin'",
+    "torch==2.15.0; sys_platform == 'darwin'",
+    "torchaudio==2.10.0; sys_platform != 'darwin'",
+    "torchaudio==2.11.1; sys_platform == 'darwin'",  # last torchaudio release; requires torch>=2.11
+    "torchcodec==0.10.0; sys_platform != 'darwin'",
+    "torchcodec==0.17.0; sys_platform == 'darwin'",
     "transformers==4.51.3",
     "peft==0.18.1",
     "huggingface-hub==0.36.2",
@@ -39,7 +43,10 @@ dependencies = [
     "rich",
     "gdown",
     "wget",
-    "setuptools<70",
+    # pyworld imports pkg_resources (loaded through the CosyVoice config even at inference),
+    # which setuptools 81 removes; torch 2.15 needs setuptools>=77.0.3.
+    "setuptools<70; sys_platform != 'darwin'",
+    "setuptools>=77.0.3,<81; sys_platform == 'darwin'",
 ]
 
 [project.optional-dependencies]

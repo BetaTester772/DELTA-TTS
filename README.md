@@ -24,18 +24,22 @@ uv sync
 
 FFmpeg must be installed on the system, since torchaudio reads and writes audio through it (e.g. `apt install ffmpeg`).
 
-**macOS (Apple Silicon).** Install the `mac` extra, which replaces `onnxruntime-gpu` (no macOS build) with `onnxruntime`, and FFmpeg from Homebrew:
+### macOS (Apple Silicon)
 
 ```bash
 brew install ffmpeg
 uv sync --extra mac
 ```
 
-DELTA-TTS and the CosyVoice 3 flow decoder and vocoder then run on MPS, the vocoder's F0 predictor in float32 instead of float64 (MPS has no float64; for whole-utterance synthesis the F0 is the same); the ONNX frontend runs on the CPU.
-`--device` defaults to CUDA, then MPS, then CPU.
+- The `mac` extra installs `onnxruntime` in place of `onnxruntime-gpu`, which has no macOS build.
+- On macOS, PyTorch 2.15 is installed instead of the paper's 2.10: its MPS backend is faster and generates the same speech tokens.
+- DELTA-TTS and the CosyVoice 3 flow decoder and vocoder run on MPS; the ONNX frontend (speech tokenizer, speaker embedding) runs on the CPU. MPS has no float64, so the vocoder's F0 predictor runs in float32, which gives the same F0 when the whole utterance is vocoded at once.
+- `--device` picks CUDA, then MPS, then CPU.
 
-**Audio processing (optional).** The `audio` extra adds [Silero VAD](https://github.com/snakers4/silero-vad) and [NVIDIA RE-USE](https://huggingface.co/nvidia/NVIDIA-NemotronLabs-RE-USE) speech enhancement (`uv sync --extra audio`, or `--extra mac --extra audio`).
-RE-USE runs on a pure-PyTorch Mamba port (`delta_tts/reuse.py`, with a Metal kernel on MPS), so `mamba-ssm` is not needed.
+### Audio processing (optional)
+
+`uv sync --extra audio` (on macOS, `uv sync --extra mac --extra audio`) adds [Silero VAD](https://github.com/snakers4/silero-vad) and [NVIDIA RE-USE](https://huggingface.co/nvidia/NVIDIA-NemotronLabs-RE-USE) speech enhancement.
+RE-USE runs on a pure-PyTorch port of its Mamba layers (`delta_tts/reuse.py`, with a Metal kernel on MPS), so `mamba-ssm` is not needed.
 
 ## Checkpoints
 

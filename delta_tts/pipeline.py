@@ -17,6 +17,7 @@ import logging
 import os
 import sys
 import uuid
+import warnings
 from collections import OrderedDict
 from pathlib import Path
 
@@ -67,7 +68,11 @@ class DeltaTTSPipeline:
         self.model = DeltaTTS(backbone_dir).to(self.device).float().eval()
         self.model.load_checkpoint(checkpoint)
         self.model.merge_lora()
-        self.cosyvoice = CosyVoice3(backbone_dir)
+        with warnings.catch_warnings():
+            # The CosyVoice config imports pyworld, which imports pkg_resources; setuptools 80
+            # (used on macOS) warns about that import.
+            warnings.filterwarnings("ignore", message="pkg_resources is deprecated", category=UserWarning)
+            self.cosyvoice = CosyVoice3(backbone_dir)
         self.sample_rate = self.cosyvoice.sample_rate  # 24 kHz
         self.audio_processor = audio_processor
         self._prompt_cache: OrderedDict[tuple, dict] = OrderedDict()
