@@ -60,6 +60,19 @@ struct SynthesisRequest: Encodable, Sendable {
     var warnings: DemoConfig.Thresholds
 }
 
+/// GET /progress: the request in flight on the server.
+struct ProgressSnapshot: Decodable, Equatable, Sendable {
+    var state: String  // "idle", "preparing" or "generating"
+    var stage: String?  // "prompt", "tokens", "acoustic" or "vocoder"
+    var fraction: Double?  // 0...1, nil when indeterminate
+    var requestId: Int
+
+    enum CodingKeys: String, CodingKey {
+        case state, stage, fraction
+        case requestId = "request_id"
+    }
+}
+
 /// POST /prepare body: the prompt part of a synthesis request.
 struct PrepareRequest: Encodable, Sendable {
     var promptText: String
@@ -167,6 +180,12 @@ struct ServerClient: Sendable {
 
     func synthesize(_ body: SynthesisRequest) async throws -> SynthesisResponse {
         try await post("synthesize", body, timeout: 900, as: SynthesisResponse.self)  // long texts on a slow device
+    }
+
+    func progress() async throws -> ProgressSnapshot {
+        var request = URLRequest(url: baseURL.appending(path: "progress"))
+        request.timeoutInterval = 2
+        return try await send(request, as: ProgressSnapshot.self)
     }
 
     /// Process the prompt ahead of synthesis (VAD trim, enhancement, features).

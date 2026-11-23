@@ -254,6 +254,26 @@ struct PlaybackBar: View {
     }
 }
 
+/// A thin rounded track with a blue fill, as the playback bar; the fill eases linearly to each new
+/// `fraction` over `easing` seconds, so it moves smoothly between updates without overshooting.
+struct ProgressTrack: View {
+    @Environment(\.uiScale) private var scale
+    var fraction: Double
+    var easing: Double = 0.12
+
+    var body: some View {
+        GeometryReader { geometry in
+            ZStack(alignment: .leading) {
+                Capsule().fill(Theme.hairline)
+                Capsule().fill(Theme.accent)
+                    .frame(width: geometry.size.width * min(1, max(0, fraction)))
+                    .animation(.linear(duration: easing), value: fraction)
+            }
+        }
+        .frame(height: 6 * scale)
+    }
+}
+
 extension Notice.Level {
     var color: Color {
         switch self {

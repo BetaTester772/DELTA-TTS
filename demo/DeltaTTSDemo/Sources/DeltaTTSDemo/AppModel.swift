@@ -100,6 +100,13 @@ final class AppModel {
     }
 
     private(set) var prepareState = PrepareState.idle
+    /// The server's progress of the generation in flight, polled while it runs.
+    private(set) var generationProgress: ProgressSnapshot?
+    /// Its fraction, never going backwards within one generation; nil while indeterminate.
+    private(set) var generationFraction: Double?
+    @ObservationIgnored private var prepareTask: Task<Void, Never>?
+    @ObservationIgnored private var synthesisTask: Task<Void, Never>?
+    @ObservationIgnored private var progressTask: Task<Void, Never>?
     private(set) var prepareNotices: [Notice] = []
     @ObservationIgnored private var prepareToken = UUID()  // tags a prepare; a later one makes it stale
     @ObservationIgnored private var preparedKey = ""  // the prompt, transcript and processing it was for
@@ -210,7 +217,8 @@ final class AppModel {
         let p = config.processing
         let promptText = transcript, warnings = config.warnings
         let name = selection == .recording ? "recording.wav" : promptURL.lastPathComponent
-        Task {
+        prepareTask?.cancel()
+        prepareTask = Task {
             do {
                 let audio = try Data(contentsOf: promptURL)
                 guard audio.count <= Self.maxUploadBytes else { throw PromptError.tooLarge(audio.count) }
@@ -233,6 +241,7 @@ final class AppModel {
 
     /// Forget any prepare in progress or done (a new recording, Next visitor).
     private func dropPrepare() {
+        prepareTask?.cancel()
         prepareToken = UUID()
         prepareState = .idle
         prepareNotices = []
@@ -495,6 +504,37 @@ final class AppModel {
         }
     }
 
+    /// Generate in a task the model owns, so that Next visitor can cancel it.
+    func generate() {
+        guard !isSynthesizing else { return }
+        synthesisTask = Task { await synthesize() }
+    }
+
+    /// "Preparing your voice...", "Shaping your voice...", ... for the generation in flight.
+    var generationStageLine: String {
+        guard let progress = generationProgress, progress.state != "idle" else { return "Generating..." }
+        if progress.state == "preparing" || progress.stage == "prompt" { return "Preparing your voice..." }
+        switch progress.stage {
+        case "tokens": return "Shaping your voice..."
+        case "acoustic": return "Rendering audio..."
+        case "vocoder": return "Almost done..."
+        default: return "Generating..."
+        }
+    }
+
+    /// Poll GET /progress every 100 ms while a generation is in flight.
+    private func pollProgress(client: ServerClient) async {
+        while !Task.isCancelled, isSynthesizing {
+            if let snapshot = try? await client.progress(), !Task.isCancelled, isSynthesizing {
+                generationProgress = snapshot
+                if snapshot.state == "generating", let fraction = snapshot.fraction {
+                    generationFraction = max(generationFraction ?? 0, fraction)
+                }
+            }
+            try? await Task.sleep(for: .milliseconds(100))
+        }
+    }
+
     func synthesize() async {
         guard !isSynthesizing else { return }
         guard blockingReason == nil, let promptURL, let client else {
@@ -505,7 +545,15 @@ final class AppModel {
         let key = inputKey
         isSynthesizing = true
         generationError = nil
-        defer { isSynthesizing = false }
+        generationProgress = nil
+        generationFraction = nil
+        progressTask = Task { await pollProgress(client: client) }
+        defer {
+            isSynthesizing = false
+            progressTask?.cancel()
+            generationProgress = nil
+            generationFraction = nil
+        }
         player.stop()
         promptPlayer.stop()
         do {
@@ -637,7 +685,7 @@ final class AppModel {
         switch primaryAction {
         case .record: startRecording()
         case .stopRecording: stopRecording()
-        case .generate: Task { await synthesize() }
+        case .generate: generate()
         case .play, .playAgain, .stopPlayback: toggleOutputPlayback()
         case .generating, .resetting: break
         }
@@ -646,7 +694,7 @@ final class AppModel {
     /// Return (or Command-Return) in the text field: generate, when that is the next step.
     func performPrimaryActionFromText() {
         if primaryAction == .generate, primaryActionEnabled {
-            Task { await synthesize() }
+            generate()
         }
     }
 
@@ -738,6 +786,10 @@ final class AppModel {
     // -----------------------------
     /// Delete the recording, ask the server to forget it, and start over with the defaults.
     func nextVisitor() async {
+        // Cancel what is in flight first (also its URLSession request), then reset: a late
+        // response of the previous visitor is dropped by the visitor and prepare tags.
+        synthesisTask?.cancel()
+        progressTask?.cancel()
         visitor = UUID()
         dropPrepare()
         recorder.deleteAll()
@@ -785,6 +837,9 @@ final class AppModel {
     /// While the app quits: delete the recordings, ask the server to forget the visitor (waiting
     /// at most 1.5 s) and stop a server the app started.
     func cleanUpForQuit() {
+        prepareTask?.cancel()
+        synthesisTask?.cancel()
+        progressTask?.cancel()
         recorder.removeDirectory()
         if serverState == .ready, let client {
             client.resetBlocking(timeout: 1.5)

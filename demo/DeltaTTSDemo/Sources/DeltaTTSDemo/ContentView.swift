@@ -625,7 +625,7 @@ struct GenerateStep: View {
             if model.isSynthesizing {
                 HStack(spacing: 8 * scale) {
                     ProgressView().controlSize(.small)
-                    Text("Generating your voice...")
+                    Text(model.generationStageLine)
                 }
                 .scaledFont(TypeSize.caption)
                 .foregroundStyle(Theme.secondaryText)
@@ -751,6 +751,14 @@ struct PrimaryButton: View {
 
     var body: some View {
         let action = model.primaryAction
+        if action == .generating {
+            GenerationProgress()
+        } else {
+            button(action)
+        }
+    }
+
+    private func button(_ action: AppModel.PrimaryAction) -> some View {
         Button(action: model.performPrimaryAction) {
             HStack(spacing: 10 * scale) {
                 if let systemImage = action.systemImage {
@@ -771,6 +779,33 @@ struct PrimaryButton: View {
         .disabled(!model.primaryActionEnabled)
         .help(action.shortcutHint.isEmpty ? action.title : "\(action.title) (\(action.shortcutHint))")
         .animation(.snappy, value: action)
+    }
+}
+
+/// The primary spot while generating: the stage in plain words over a thin determinate bar, or a
+/// spinner while the server cannot say how far it is. No step counts or timings.
+struct GenerationProgress: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.uiScale) private var scale
+
+    var body: some View {
+        VStack(spacing: 8 * scale) {
+            HStack(spacing: 8 * scale) {
+                if model.generationFraction == nil {
+                    ProgressView().controlSize(.small)
+                }
+                Text(model.generationStageLine)
+                    .scaledFont(TypeSize.body, weight: .semibold)
+                    .foregroundStyle(Theme.primaryText)
+                    .contentTransition(.opacity)
+                    .animation(.snappy, value: model.generationStageLine)
+            }
+            if let fraction = model.generationFraction {
+                ProgressTrack(fraction: fraction)
+            }
+        }
+        .frame(width: 252 * scale, height: 48 * scale)
+        .padding(.vertical, 6 * scale)
     }
 }
 
