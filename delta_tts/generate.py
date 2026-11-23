@@ -20,7 +20,7 @@ import torch.nn.functional as F
 
 from delta_tts.model import EOS_TOKEN, MASK_TOKEN, SPEECH_TOKEN_SIZE, DeltaTTS
 
-__all__ = ["generate", "unmask_schedule", "top_p_filter"]
+__all__ = ["generate", "top_p_filter", "unmask_schedule"]
 
 MAX_REPEAT = 3
 

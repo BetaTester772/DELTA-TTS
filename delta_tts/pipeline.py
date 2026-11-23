@@ -24,7 +24,7 @@ from delta_tts.model import DeltaTTS
 COSYVOICE_DIR = Path(__file__).resolve().parent.parent / "third_party" / "CosyVoice"
 sys.path.insert(0, str(COSYVOICE_DIR))
 sys.path.insert(0, str(COSYVOICE_DIR / "third_party" / "Matcha-TTS"))
-from cosyvoice.cli.cosyvoice import CosyVoice3  # noqa: E402
+from cosyvoice.cli.cosyvoice import CosyVoice3
 
 __all__ = ["DeltaTTSPipeline"]
 
