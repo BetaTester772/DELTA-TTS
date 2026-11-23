@@ -43,11 +43,12 @@ class AudioProcessor:
         trim_output: Trim leading and trailing non-speech of the output with Silero VAD.
         reuse_dir: RE-USE directory (`config.json`, `model.safetensors`) or Hugging Face repo id.
         device: Torch device for RE-USE. Silero VAD runs on the CPU.
-        pad_ms: Non-speech kept before the first and after the last speech segment.
+        pad_ms: Audio kept before the first and after the last speech segment, so that soft
+            onsets and word endings (e.g. a final fricative weakened by enhancement) are not cut.
     """
 
     def __init__(self, enhance_prompt: bool = False, trim_prompt: bool = False, trim_output: bool = False,
-                 reuse_dir: str = REPO_ID, device: str = "cpu", pad_ms: int = 100) -> None:
+                 reuse_dir: str = REPO_ID, device: str = "cpu", pad_ms: int = 200) -> None:
         self.trim_prompt = trim_prompt
         self.trim_output = trim_output
         self.pad_ms = pad_ms
