@@ -80,6 +80,7 @@ AUDIO_ERRORS = (OSError, RuntimeError, EOFError, ValueError, ArithmeticError, wa
 DRY_RUN_SAMPLE_RATE = 24000
 DRY_RUN_LOAD_SECONDS = 1.0  # simulated model loading, so that clients see the "loading" state
 DRY_RUN_PREPARE_SECONDS = 0.8  # simulated prompt processing
+MAX_TEST_DELAY_SECONDS = 5  # dry run only: "test_delay_s" waits before taking the lock, to test races
 # Simulated synthesis stages (step count, seconds per step), roughly as on an Apple Silicon Mac
 DRY_RUN_STAGES = {"prompt": (1, 0.4), "tokens": (16, 0.036), "acoustic": (10, 0.055), "vocoder": (1, 0.05)}
 
@@ -256,6 +257,12 @@ class UploadStore:
         self._evict()
         return target
 
+    def remove(self, path: Path) -> None:
+        """Delete one stored upload (no-op for other paths)."""
+        if path.parent == self.dir:
+            self._files.pop(path, None)
+            path.unlink(missing_ok=True)
+
     def clear(self) -> int:
         """Delete every stored upload. Returns: the number of files removed."""
         removed = 0
@@ -350,6 +357,10 @@ class PreparedPrompts:
             raise RequestError(HTTPStatus.NOT_FOUND, "prompt_unknown",
                                "Unknown prompt_id; send the prompt audio again.")
         return path
+
+    def forget(self, path: Path) -> None:
+        for prompt_id in [i for i, p in self._paths.items() if p == path]:
+            del self._paths[prompt_id]
 
     def clear(self) -> int:
         removed = len(self._paths)
@@ -638,6 +649,11 @@ class Progress:
                         seconds[stage] = (1 - STAGE_EMA) * seconds[stage] + STAGE_EMA * observed
             self._reset("idle", self._mode)
 
+    def clear(self) -> None:
+        """Forget the last request's state (on /reset); the learned stage weights stay."""
+        with self._lock:
+            self._reset("idle", self._mode)
+
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
             return {"state": self._state, "stage": self._stage, "step": self._step, "total": self._total,
@@ -672,6 +688,9 @@ class TTSService:
         self.uploads = UploadStore()
         self.prepared = PreparedPrompts()
         self.progress = Progress()
+        # Incremented by /reset. /prepare and /synthesize read it on arrival and give up if a
+        # reset ran before they got the lock, so that nothing of the previous visitor survives it.
+        self._epoch = 0
         self._has_progress = False  # whether DeltaTTSPipeline.synthesize takes `progress`
         self._dry_cache: set[Path] = set()  # prompts the dry run treats as cached
         # Directories that prompt_wav_path may point into
@@ -741,9 +760,11 @@ class TTSService:
         clear the pipeline's cached prompt features, which include speaker embeddings. Waits for a
         running synthesis or preparation."""
         with self._lock:
+            self._epoch += 1
             removed = self.uploads.clear()
             forgotten = self.prepared.clear()
             self._dry_cache.clear()
+            self.progress.clear()
             cleared = 0
             if self.tts is not None:
                 cleared = len(self.tts._prompt_cache)
@@ -752,6 +773,30 @@ class TTSService:
                     removed, forgotten, cleared)
         return {"status": "ok", "removed_uploads": removed, "forgotten_prompts": forgotten,
                 "cleared_prompt_features": cleared}
+
+    def _arrive(self, body: dict[str, Any]) -> int:
+        """Note the reset epoch of a request as it arrives, before anything is validated or stored.
+        In the dry run, `test_delay_s` then waits before the lock is taken (for testing races)."""
+        epoch = self._epoch
+        delay = body.get("test_delay_s")
+        if self.dry_run and isinstance(delay, int | float) and not isinstance(delay, bool) and 0 < delay <= MAX_TEST_DELAY_SECONDS:
+            time.sleep(delay)
+        return epoch
+
+    def _check_epoch(self, epoch: int, stored: Path | None = None) -> None:
+        """Reject a request that arrived before the last /reset (call while holding the lock),
+        removing what it has stored so far."""
+        if epoch == self._epoch:
+            return
+        if stored is not None:
+            self.uploads.remove(stored)
+            self.prepared.forget(stored)
+            self._dry_cache.discard(stored)
+            if self.tts is not None:
+                path = os.path.abspath(stored)
+                for key in [k for k in self.tts._prompt_cache if k[0] == path]:
+                    del self.tts._prompt_cache[key]
+        raise RequestError(HTTPStatus.CONFLICT, "reset_in_progress", "Reset in progress; please try again.")
 
     def _check_ready(self) -> None:
         if self.status == "loading":
@@ -767,7 +812,9 @@ class TTSService:
         and the same processing does no prompt processing. A /synthesize that arrives meanwhile
         waits for the lock and then finds the cache warm."""
         self._check_ready()
+        epoch = self._arrive(body)
         with self._lock:
+            self._check_epoch(epoch)
             self.progress.begin("preparing", self.compute)
             success = False
             try:
@@ -775,7 +822,6 @@ class TTSService:
                 check_transcript(prompt.prompt_text, notices)
                 check_processing(prompt.processing)
                 seconds = check_prompt_audio(prompt, notices)
-                prompt_id = self.prepared.register(prompt.prompt_wav)
                 if self.dry_run:
                     time.sleep(DRY_RUN_PREPARE_SECONDS)
                     processed = seconds  # no trimming in the dry run
@@ -785,6 +831,8 @@ class TTSService:
                                           "Dry run: the prompt is registered, but not trimmed or enhanced."))
                 else:
                     processed = self._prepare_model(prompt, notices)
+                self._check_epoch(epoch, stored=prompt.prompt_wav)
+                prompt_id = self.prepared.register(prompt.prompt_wav)
                 success = True
             finally:
                 self.progress.end(success)
@@ -834,7 +882,9 @@ class TTSService:
     def synthesize(self, body: dict[str, Any], notices: list[Notice]) -> dict[str, Any]:
         """Serve one /synthesize request. Notices are appended to `notices` as they arise."""
         self._check_ready()
+        epoch = self._arrive(body)
         with self._lock:
+            self._check_epoch(epoch)
             request = parse_request(body, self.config, self.uploads, self.prompt_roots, self.prepared)
             estimate = check_request(request, notices)
             self.progress.begin("generating", request.compute)
@@ -844,6 +894,7 @@ class TTSService:
                     pcm, elapsed, fell_back = self._synthesize_dry_run(request, estimate, notices)
                 else:
                     pcm, elapsed, fell_back = self._synthesize_model(request, notices)
+                self._check_epoch(epoch, stored=request.prompt_wav)
                 success = True
             finally:
                 self.progress.end(success)
