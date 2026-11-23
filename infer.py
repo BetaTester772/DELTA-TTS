@@ -58,7 +58,8 @@ def main() -> None:
     if args.enhance_prompt or args.trim_prompt or args.trim_output:
         from delta_tts.audio import AudioProcessor
 
-        audio_processor = AudioProcessor(args.enhance_prompt, args.trim_prompt, args.trim_output, args.reuse_dir, device)
+        audio_processor = AudioProcessor(enhance_prompt=args.enhance_prompt, trim_prompt=args.trim_prompt,
+                                         trim_output=args.trim_output, reuse_dir=args.reuse_dir, device=device)
     tts = DeltaTTSPipeline(args.backbone_dir, args.checkpoint, device, audio_processor)
     decoding = {"num_steps": args.num_steps, "temperature": args.temperature}
 

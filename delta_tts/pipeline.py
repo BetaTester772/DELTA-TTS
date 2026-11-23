@@ -20,6 +20,7 @@ import uuid
 import warnings
 from collections import OrderedDict
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -31,6 +32,9 @@ COSYVOICE_DIR = Path(__file__).resolve().parent.parent / "third_party" / "CosyVo
 sys.path.insert(0, str(COSYVOICE_DIR))
 sys.path.insert(0, str(COSYVOICE_DIR / "third_party" / "Matcha-TTS"))
 from cosyvoice.cli.cosyvoice import CosyVoice3
+
+if TYPE_CHECKING:
+    from delta_tts.audio import AudioProcessor
 
 __all__ = ["DeltaTTSPipeline", "default_device"]
 
@@ -63,7 +67,8 @@ class DeltaTTSPipeline:
             to the prompt before and to the output after synthesis.
     """
 
-    def __init__(self, backbone_dir: str, checkpoint: str, device: str | None = None, audio_processor=None) -> None:
+    def __init__(self, backbone_dir: str, checkpoint: str, device: str | None = None,
+                 audio_processor: "AudioProcessor | None" = None) -> None:
         self.device = torch.device(device or default_device())
         self.model = DeltaTTS(backbone_dir).to(self.device).float().eval()
         self.model.load_checkpoint(checkpoint)
