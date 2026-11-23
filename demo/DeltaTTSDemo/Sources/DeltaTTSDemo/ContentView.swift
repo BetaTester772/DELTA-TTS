@@ -2,18 +2,24 @@ import AppKit
 import SwiftUI
 import UniformTypeIdentifiers
 
-/// The main window, for visitors.
+/// The main window, for visitors: the steps as a guide, and below them one fixed action bar whose
+/// primary button does the next thing (record, stop, generate, play, next visitor), so the cursor
+/// can stay in one place.
 struct ContentView: View {
     @Environment(AppModel.self) private var model
     @State private var width: CGFloat = 1280
     @State private var exporting = false
+    @FocusState private var textFocused: Bool
 
     var body: some View {
         ScrollView {
-            MainContent(width: width, exporting: $exporting)
+            MainContent(width: width, textFocused: $textFocused, exporting: $exporting)
         }
         .scrollBounceBehavior(.basedOnSize)
         .scrollIndicators(.never)  // a legacy scroller would narrow the content and could make the layout oscillate
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            ActionBar(textFocused: $textFocused)
+        }
         .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { width = $0 }
         .background(Theme.page)
         .mainScreenStyle(scale: model.config.app.uiScale)
@@ -54,6 +60,7 @@ struct MainContent: View {
     @Environment(AppModel.self) private var model
     @Environment(\.uiScale) private var scale
     var width: CGFloat
+    var textFocused: FocusState<Bool>.Binding
     @Binding var exporting: Bool
 
     static let maxWidth: CGFloat = 1600
@@ -70,24 +77,25 @@ struct MainContent: View {
                     .transition(.opacity)
             } else {
                 NoticeStack()
+                RecordStep()
                 if contentWidth >= 900 * scale {
-                    RecordStep()
                     HStack(alignment: .top, spacing: gap) {
-                        TextStep()
+                        TextStep(textFocused: textFocused)
                         GenerateStep()
+                            .frame(width: (contentWidth - 2 * gap) * 0.25)
+                        ListenStep(exporting: $exporting)
+                            .frame(width: (contentWidth - 2 * gap) * 0.25)
                     }
-                    ListenStep(compact: false, exporting: $exporting)
                 } else {
-                    RecordStep()
-                    TextStep()
+                    TextStep(textFocused: textFocused)
                     GenerateStep()
-                    ListenStep(compact: true, exporting: $exporting)
+                    ListenStep(exporting: $exporting)
                 }
             }
         }
         .padding(.horizontal, padding)
         .padding(.top, 30)  // clear of the window buttons (hidden title bar)
-        .padding(.bottom, 24 * scale)
+        .padding(.bottom, 16 * scale)
         .frame(maxWidth: Self.maxWidth)
         .frame(maxWidth: .infinity)
     }
@@ -96,6 +104,7 @@ struct MainContent: View {
 // -----------------------------
 // Header, what to do now, notices
 // -----------------------------
+
 struct HeaderView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.uiScale) private var scale
@@ -118,7 +127,7 @@ struct HeaderView: View {
                 EngineStatus()
                 GlassEffectContainer(spacing: 8 * scale) {
                     HStack(spacing: 8 * scale) {
-                        NextVisitorButton(prominent: false)
+                        NextVisitorButton()
                         SettingsLink {
                             Image(systemName: "gearshape")
                                 .font(.system(size: 16 * scale))
@@ -130,17 +139,91 @@ struct HeaderView: View {
                     }
                 }
             }
-            if !demo.subtitle.isEmpty {
-                Text(demo.subtitle)
-                    .scaledFont(TypeSize.subtitle)
-                    .foregroundStyle(Theme.secondaryText)
-                    .fixedSize(horizontal: false, vertical: true)
+            ViewThatFits(in: .horizontal) {
+                HStack(alignment: .firstTextBaseline, spacing: 24 * scale) {
+                    subtitle
+                    Spacer(minLength: 0)
+                    DeviceStrip()
+                }
+                VStack(alignment: .leading, spacing: 8 * scale) {
+                    subtitle
+                    HStack {
+                        Spacer(minLength: 0)
+                        DeviceStrip()
+                    }
+                }
             }
             Rectangle()
                 .fill(Theme.hairline)
                 .frame(height: 1)
                 .padding(.top, 12 * scale)
         }
+    }
+}
+
+extension HeaderView {
+    @ViewBuilder fileprivate var subtitle: some View {
+        if !model.config.demo.subtitle.isEmpty {
+            Text(model.config.demo.subtitle)
+                .scaledFont(TypeSize.subtitle)
+                .foregroundStyle(Theme.secondaryText)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+}
+
+/// Microphone, output and compute mode, for staff: quiet, in the header, away from the action bar.
+/// They edit the same settings as Settings.
+struct DeviceStrip: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.uiScale) private var scale
+
+    var body: some View {
+        @Bindable var model = model
+        HStack(alignment: .firstTextBaseline, spacing: 18 * scale) {
+            MicrophoneMenu()
+            OutputMenu()
+            HStack(alignment: .firstTextBaseline, spacing: 6 * scale) {
+                Text("Mode:")
+                    .foregroundStyle(Theme.secondaryText)
+                Picker("Mode", selection: $model.computeMode) {
+                    Text("Exact").tag(ComputeMode.exact)
+                    Text("Fast").tag(ComputeMode.fast)
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .controlSize(.small)
+                .fixedSize()
+            }
+        }
+        .scaledFont(TypeSize.caption)
+    }
+}
+
+/// The output device: the system default (followed when it changes) or a chosen one.
+struct OutputMenu: View {
+    @Environment(AppModel.self) private var model
+
+    var body: some View {
+        Menu {
+            Button("System default" + (model.audioDevices.defaultOutputName.map { " (\($0))" } ?? "")) {
+                model.chooseOutput(nil)
+            }
+            if !model.audioDevices.outputs.isEmpty {
+                Divider()
+                ForEach(model.audioDevices.outputs) { device in
+                    Button(device.name) { model.chooseOutput(device) }
+                }
+            }
+        } label: {
+            Text(model.outputLabel)
+                .scaledFont(TypeSize.caption, weight: .medium)
+                .lineLimit(1)
+        }
+        .menuStyle(.button)
+        .buttonStyle(.borderless)
+        .fixedSize()
+        .foregroundStyle(Theme.secondaryText)
     }
 }
 
@@ -265,74 +348,48 @@ struct NoticeBanner: View {
 // -----------------------------
 // 1 Read and record
 // -----------------------------
+/// The sentence to read and the recording's state; the buttons are in the action bar.
 struct RecordStep: View {
     @Environment(AppModel.self) private var model
     @Environment(\.uiScale) private var scale
 
     var body: some View {
-        StepCard(number: 1, title: "Read and record", status: model.status(ofStep: 1)) {
+        StepCard(number: 1, title: "Read and record", status: model.status(ofStep: 1), minHeight: 0) {
             switch model.selection {
-            case .recording: ownVoice
-            case .preset: sampleVoice
-            }
-        }
-    }
-
-    @ViewBuilder private var ownVoice: some View {
-        Teleprompter(text: model.transcript, size: TypeSize.prompter * scale, active: false)
-        HStack(spacing: 10 * scale) {
-            Button(action: model.startRecording) {
-                ActionLabel(title: model.recorder.take == nil ? "Record your voice" : "Record again", systemImage: "mic.fill")
-            }
-            .actionStyle(prominent: model.currentStep == 1)
-            .controlSize(.large)
-            .keyboardShortcut("r", modifiers: .command)
-            .disabled(!model.canRecord)
-            if let take = model.recorder.take {
-                Button(action: model.togglePromptPlayback) {
-                    ActionLabel(title: model.promptPlayer.isPlaying ? "Stop" : "Play",
-                                systemImage: model.promptPlayer.isPlaying ? "stop.fill" : "play.fill")
+            case .recording:
+                Teleprompter(text: model.transcript, size: TypeSize.prompter * scale, active: false)
+                HStack(alignment: .firstTextBaseline, spacing: 16 * scale) {
+                    if let take = model.recorder.take {
+                        Label("Recorded \(formatSeconds(take.duration))", systemImage: "checkmark.circle.fill")
+                            .foregroundStyle(Theme.accent)
+                            .fontWeight(.medium)
+                    } else {
+                        Text("Your recording is used only for this demo and is deleted on \u{201C}Next visitor\u{201D} or when the app quits.")
+                            .foregroundStyle(Theme.tertiaryText)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    Spacer(minLength: 12 * scale)
+                    SampleVoiceMenu(title: "No microphone? Use a sample voice")
                 }
-                .buttonStyle(.glass)
-                .controlSize(.large)
-                Text("\(formatSeconds(take.duration)) recorded")
-                    .scaledFont(TypeSize.caption)
-                    .foregroundStyle(Theme.secondaryText)
-            }
-            Spacer(minLength: 12 * scale)
-            MicrophoneMenu()
-        }
-        HStack(alignment: .firstTextBaseline, spacing: 12 * scale) {
-            Text("Your recording is used only for this demo and is deleted on \u{201C}Next visitor\u{201D} or when the app quits.")
                 .scaledFont(TypeSize.caption)
-                .foregroundStyle(Theme.tertiaryText)
-                .fixedSize(horizontal: false, vertical: true)
-            Spacer(minLength: 12 * scale)
-            SampleVoiceMenu(title: "No microphone? Use a sample voice")
-        }
-    }
-
-    @ViewBuilder private var sampleVoice: some View {
-        Text("Sample voice: \(model.selectedPreset?.name ?? "")")
-            .scaledFont(TypeSize.body, weight: .semibold)
-        Text("\u{201C}\(model.transcript)\u{201D}")
-            .scaledFont(TypeSize.body)
-            .foregroundStyle(Theme.secondaryText)
-            .fixedSize(horizontal: false, vertical: true)
-        HStack(spacing: 10 * scale) {
-            Button(action: model.togglePromptPlayback) {
-                ActionLabel(title: model.promptPlayer.isPlaying ? "Stop" : "Play sample",
-                            systemImage: model.promptPlayer.isPlaying ? "stop.fill" : "play.fill")
+            case .preset:
+                Text("Sample voice: \(model.selectedPreset?.name ?? "")")
+                    .scaledFont(TypeSize.body, weight: .semibold)
+                Text("\u{201C}\(model.transcript)\u{201D}")
+                    .scaledFont(TypeSize.body)
+                    .foregroundStyle(Theme.secondaryText)
+                    .fixedSize(horizontal: false, vertical: true)
+                HStack(spacing: 16 * scale) {
+                    Button("Use my own voice", action: model.useOwnVoice)
+                        .buttonStyle(.borderless)
+                        .foregroundStyle(Theme.accent)
+                        .fontWeight(.medium)
+                    SampleVoiceMenu(title: "Choose another sample voice")
+                    Spacer()
+                }
+                .scaledFont(TypeSize.caption)
             }
-            .buttonStyle(.glass)
-            .controlSize(.large)
-            Button(action: model.useOwnVoice) {
-                ActionLabel(title: "Use my own voice", systemImage: "mic.fill")
-            }
-            .buttonStyle(.glass)
-            .controlSize(.large)
         }
-        SampleVoiceMenu(title: "Choose another sample voice")
     }
 }
 
@@ -361,7 +418,6 @@ struct MicrophoneMenu: View {
         .fixedSize()
         .foregroundStyle(Theme.secondaryText)
         .disabled(model.recorder.isCapturing)
-        .help("Staff: choose the microphone. It is also in Settings > Demo.")
     }
 }
 
@@ -387,7 +443,8 @@ struct SampleVoiceMenu: View {
     }
 }
 
-/// Countdown and recording: the sentence fills the width, with the level, the time and Stop.
+/// Countdown and recording: the sentence fills the width, with the level and the time. Stop is
+/// the primary button of the action bar, where Record was.
 struct RecordingFocusView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.uiScale) private var scale
@@ -434,16 +491,7 @@ struct RecordingFocusView: View {
                     .foregroundStyle(Theme.secondaryText)
             }
 
-            Button(action: model.stopRecording) {
-                ActionLabel(title: recorder.state == .recording ? "Stop" : "Cancel", systemImage: "stop.fill")
-                    .frame(minWidth: 140 * scale)
-            }
-            .buttonStyle(.glassProminent)
-            .tint(Theme.accent)
-            .controlSize(.large)
-            .keyboardShortcut("r", modifiers: .command)
-
-            Text("Press Stop when you have finished the sentence. Recording stops by itself after \(Int(recorder.maxSeconds)) s.")
+            Text("Press Stop below when you have finished the sentence. Recording stops by itself after \(Int(recorder.maxSeconds)) s.")
                 .scaledFont(TypeSize.caption)
                 .foregroundStyle(Theme.tertiaryText)
                 .multilineTextAlignment(.center)
@@ -458,23 +506,40 @@ struct RecordingFocusView: View {
 // -----------------------------
 // 2 Type what to say
 // -----------------------------
+/// The text to say, prefilled; Return generates.
 struct TextStep: View {
     @Environment(AppModel.self) private var model
     @Environment(\.uiScale) private var scale
+    var textFocused: FocusState<Bool>.Binding
 
     var body: some View {
         @Bindable var model = model
         let limit = Int(model.config.warnings.maxTextChars)
         StepCard(number: 2, title: "Type what to say", status: model.status(ofStep: 2), minHeight: 168 * scale) {
-            TextEditor(text: $model.text)
+            TextField("What should your voice say?", text: $model.text, axis: .vertical)
+                .textFieldStyle(.plain)
                 .scaledFont(TypeSize.body)
-                .foregroundStyle(Theme.primaryText)
-                .scrollContentBackground(.hidden)
-                .padding(8 * scale)
-                .frame(height: 62 * scale)
+                .lineLimit(2...3)
+                .focused(textFocused)
+                .onSubmit { model.performPrimaryActionFromText() }
+                .padding(10 * scale)
+                .frame(minHeight: 62 * scale, alignment: .topLeading)
                 .background(Theme.well, in: .rect(cornerRadius: 10))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 10)
+                        .strokeBorder(textFocused.wrappedValue ? Theme.accent : Color.clear, lineWidth: 1.5)
+                }
+            .background {
+                // Command-Return in the field also generates (Return is handled by onSubmit).
+                Button("Generate my voice", action: model.performPrimaryActionFromText)
+                    .keyboardShortcut(.return, modifiers: .command)
+                    .opacity(0)
+                    .frame(width: 0, height: 0)
+                    .allowsHitTesting(false)
+                    .accessibilityHidden(true)
+            }
             HStack {
-                Text("Change the words if you like.")
+                Text("Optional. Press Return to generate.")
                 Spacer()
                 Text("\(model.text.count) / \(limit)")
                     .monospacedDigit()
@@ -489,147 +554,196 @@ struct TextStep: View {
 // -----------------------------
 // 3 Generate
 // -----------------------------
+/// The state of generation; the button is in the action bar.
 struct GenerateStep: View {
     @Environment(AppModel.self) private var model
     @Environment(\.uiScale) private var scale
 
     var body: some View {
         StepCard(number: 3, title: "Generate", status: model.status(ofStep: 3), minHeight: 168 * scale) {
-            HStack(spacing: 14 * scale) {
-                Button(action: generate) {
-                    HStack(spacing: 8 * scale) {
-                        if model.isSynthesizing {
-                            ProgressView().controlSize(.small)
-                        }
-                        Text(model.isSynthesizing ? "Generating..." : "Generate my voice")
-                    }
-                    .scaledFont(TypeSize.action, weight: .semibold)
-                    .padding(.horizontal, 6 * scale)
-                    .padding(.vertical, 4 * scale)
+            if model.isSynthesizing {
+                HStack(spacing: 8 * scale) {
+                    ProgressView().controlSize(.small)
+                    Text("Generating your voice...")
                 }
-                .actionStyle(prominent: model.currentStep == 3)
-                .controlSize(.large)
-                .keyboardShortcut(.return, modifiers: .command)
-                .disabled(model.isSynthesizing || model.blockingReason != nil)
-                Text(hint)
+                .scaledFont(TypeSize.caption)
+                .foregroundStyle(Theme.secondaryText)
+            } else if model.outputIsCurrent {
+                Label("Your voice is ready.", systemImage: "checkmark.circle.fill")
+                    .scaledFont(TypeSize.caption, weight: .medium)
+                    .foregroundStyle(Theme.accent)
+            } else {
+                Text(model.blockingReason ?? "Press \u{201C}Generate my voice\u{201D} below.")
                     .scaledFont(TypeSize.caption)
                     .foregroundStyle(Theme.tertiaryText)
                     .fixedSize(horizontal: false, vertical: true)
             }
         }
     }
-
-    private var hint: String {
-        if model.isSynthesizing { return "This takes a few seconds." }
-        return model.blockingReason ?? "Makes your voice say the text above."
-    }
-
-    private func generate() {
-        Task { await model.synthesize() }
-    }
 }
 
 // -----------------------------
 // 4 Listen
 // -----------------------------
+/// Playback progress and the output device; Play is in the action bar.
 struct ListenStep: View {
     @Environment(AppModel.self) private var model
     @Environment(\.uiScale) private var scale
-    var compact: Bool  // stacked, for narrow windows
     @Binding var exporting: Bool
 
     var body: some View {
-        StepCard(number: 4, title: "Listen", status: model.status(ofStep: 4)) {
-            if let output = model.output {
-                let layout = compact
-                    ? AnyLayout(VStackLayout(alignment: .leading, spacing: Spacing.item * scale))
-                    : AnyLayout(HStackLayout(alignment: .center, spacing: 18 * scale))
-                layout {
-                    Button {
-                        model.player.toggle()
-                    } label: {
-                        ActionLabel(title: model.player.isPlaying ? "Stop" : "Play again",
-                                    systemImage: model.player.isPlaying ? "stop.fill" : "play.fill")
-                    }
-                    .buttonStyle(.glass)
-                    .controlSize(.large)
-                    progress
-                        .frame(maxWidth: compact ? .infinity : 340 * scale)
-                    VStack(alignment: .leading, spacing: 2 * scale) {
-                        Text(model.speedSummary(output.response))
-                            .foregroundStyle(Theme.secondaryText)
-                        Text(model.outputLabel)
-                            .foregroundStyle(Theme.tertiaryText)
-                    }
-                    .scaledFont(TypeSize.caption)
-                    .fixedSize(horizontal: false, vertical: true)
-                    if !compact { Spacer(minLength: 0) }
-                    if model.config.app.showSaveButton {
-                        Button("Save...") { exporting = true }
-                            .buttonStyle(.glass)
-                            .controlSize(.large)
-                    }
-                    if model.currentStep == 4 {
-                        NextVisitorButton(prominent: true)
-                    }
+        StepCard(number: 4, title: "Listen", status: model.status(ofStep: 4), minHeight: 168 * scale) {
+            if model.output != nil {
+                PlaybackBar(player: model.player)
+                if model.config.app.showSaveButton {
+                    Button("Save...") { exporting = true }
+                        .buttonStyle(.borderless)
+                        .foregroundStyle(Theme.accent)
                 }
             } else {
-                HStack {
-                    Text("Your generated voice will play here.")
-                        .scaledFont(TypeSize.body)
-                        .foregroundStyle(Theme.tertiaryText)
-                    Spacer()
-                    Text(model.outputLabel)
-                        .scaledFont(TypeSize.caption)
-                        .foregroundStyle(Theme.tertiaryText)
-                }
+                Text("Your generated voice will play here.")
+                    .foregroundStyle(Theme.tertiaryText)
             }
-        }
-    }
-
-    private var progress: some View {
-        TimelineView(.animation(minimumInterval: 0.05, paused: !model.player.isPlaying)) { _ in
-            let duration = max(model.player.duration, 0.001)
-            let position = min(model.player.currentTime, duration)
-            VStack(alignment: .leading, spacing: 4) {
-                ProgressView(value: position, total: duration)
-                    .tint(Theme.accent)
-                HStack {
-                    Text(formatSeconds(position))
-                    Spacer()
-                    Text(formatSeconds(model.player.duration))
-                }
-                .scaledFont(TypeSize.caption)
-                .monospacedDigit()
+            Text(model.outputLabel)
                 .foregroundStyle(Theme.tertiaryText)
-            }
+                .fixedSize(horizontal: false, vertical: true)
         }
+        .scaledFont(TypeSize.caption)
     }
 }
 
-/// Deletes this visitor's recording and starts over (also File > Next visitor, Command-N).
-/// Secondary in the header; the emphasized last action once the generated voice is ready.
+// -----------------------------
+// Action bar
+// -----------------------------
+/// The fixed action bar at the bottom of the window: the primary button in the center, always in
+/// the same place, with the secondary actions of the moment on either side.
+struct ActionBar: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.uiScale) private var scale
+    var textFocused: FocusState<Bool>.Binding
+
+    var body: some View {
+        // No GlassEffectContainer: it would blend the neutral buttons into the tinted primary one.
+        HStack(spacing: 28 * scale) {
+            HStack(spacing: 16 * scale) { leading }
+                .frame(maxWidth: .infinity, alignment: .trailing)
+            PrimaryButton()
+            HStack(spacing: 16 * scale) { trailing }
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(.horizontal, 32 * scale)
+        .padding(.vertical, 14 * scale)
+        .frame(maxWidth: .infinity)
+        .background(Theme.page.opacity(0.92))
+        .overlay(alignment: .top) {
+            Rectangle().fill(Theme.hairline).frame(height: 1)
+        }
+    }
+
+    /// Left of the primary button: start the recording over.
+    @ViewBuilder private var leading: some View {
+        if canChangeRecording, model.selection == .recording, model.recorder.take != nil {
+            SecondaryButton(title: "Re-record", systemImage: "arrow.counterclockwise.circle",
+                            help: "Record the sentence again (\u{2318}R)", action: model.startRecording)
+                .disabled(!model.canRecord)
+        }
+    }
+
+    /// Right of the primary button: listen to the recording or play the voice again, edit the text.
+    @ViewBuilder private var trailing: some View {
+        if canChangeRecording, model.promptURL != nil {
+            if model.primaryAction == .nextVisitor {
+                SecondaryButton(title: "Play again", systemImage: "play.fill", help: "Play your voice again (\u{2318}P)",
+                                action: model.toggleOutputPlayback)
+            } else if !model.outputIsCurrent {
+                let playing = model.promptPlayer.isPlaying
+                SecondaryButton(title: playing ? "Stop" : (model.selection == .recording ? "Play my recording" : "Play sample"),
+                                systemImage: playing ? "stop.fill" : "play.fill",
+                                help: "Listen to the recording", action: model.togglePromptPlayback)
+            }
+            if !textFocused.wrappedValue {
+                SecondaryButton(title: "Edit text", systemImage: "pencil", help: "Change what your voice says") {
+                    textFocused.wrappedValue = true
+                }
+            }
+        }
+    }
+
+    private var canChangeRecording: Bool {
+        !model.recorder.isCapturing && !model.isSynthesizing && !model.isResetting
+    }
+}
+
+/// The one big filled button; its label follows `AppModel.primaryAction`.
+struct PrimaryButton: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.uiScale) private var scale
+
+    var body: some View {
+        let action = model.primaryAction
+        Button(action: model.performPrimaryAction) {
+            HStack(spacing: 10 * scale) {
+                if let systemImage = action.systemImage {
+                    Image(systemName: systemImage)
+                } else {
+                    ProgressView().controlSize(.small).tint(.white)
+                }
+                Text(action.title)
+            }
+            .scaledFont(TypeSize.action + 1, weight: .semibold)
+            .frame(minWidth: 236 * scale, minHeight: 36 * scale)
+            .padding(.vertical, 6 * scale)
+            .contentTransition(.opacity)
+        }
+        .buttonStyle(.glassProminent)
+        .tint(Theme.accent)
+        .controlSize(.large)
+        .disabled(!model.primaryActionEnabled)
+        .help(action.shortcutHint.isEmpty ? action.title : "\(action.title) (\(action.shortcutHint))")
+        .animation(.snappy, value: action)
+    }
+}
+
+/// A neutral glass button beside the primary one, at least 44 points high.
+struct SecondaryButton: View {
+    @Environment(\.uiScale) private var scale
+    var title: String
+    var systemImage: String
+    var help: String
+    var action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Label(title, systemImage: systemImage)
+                .scaledFont(TypeSize.body, weight: .medium)
+                .frame(minHeight: 32 * scale)
+                .padding(.horizontal, 4 * scale)
+                .padding(.vertical, 2 * scale)
+        }
+        .buttonStyle(.glass)
+        .controlSize(.large)
+        .help(help)
+    }
+}
+
+/// Deletes this visitor's recording and starts over (also File > Next visitor, Command-N). In
+/// the header for staff; for visitors it is the primary button once the voice has been heard.
 struct NextVisitorButton: View {
     @Environment(AppModel.self) private var model
     @Environment(\.uiScale) private var scale
-    var prominent: Bool
 
     var body: some View {
-        let button = Button {
+        Button {
             Task { await model.nextVisitor() }
         } label: {
             Label("Next visitor", systemImage: "arrow.counterclockwise")
-                .scaledFont(prominent ? TypeSize.action : TypeSize.body, weight: .semibold)
+                .scaledFont(TypeSize.body, weight: .semibold)
                 .padding(.horizontal, 4 * scale)
-                .padding(.vertical, prominent ? 4 * scale : 0)
         }
+        .buttonStyle(.bordered)
+        .tint(Theme.accent)
         .controlSize(.large)
         .disabled(model.isResetting || model.recorder.isCapturing)
         .help("Delete this visitor's recording and start over (\u{2318}N)")
-        if prominent {
-            button.buttonStyle(.glassProminent).tint(Theme.accent)
-        } else {
-            button.buttonStyle(.bordered).tint(Theme.accent)
-        }
     }
 }

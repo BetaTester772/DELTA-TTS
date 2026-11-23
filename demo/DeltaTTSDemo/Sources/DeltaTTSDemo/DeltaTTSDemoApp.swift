@@ -19,6 +19,19 @@ struct DeltaTTSDemoApp: App {
                 }
                 .keyboardShortcut("n", modifiers: .command)
             }
+            CommandGroup(replacing: .printItem) {}  // Command-P plays
+            CommandMenu("Demo") {
+                // Space is not a key equivalent here: it would fire while typing. AppDelegate
+                // handles it when no text field has focus.
+                Button("Next step (Space)") { appDelegate.model.performPrimaryAction() }
+                Divider()
+                Button("Record or stop") { appDelegate.model.toggleRecording() }
+                    .keyboardShortcut("r", modifiers: .command)
+                Button("Generate my voice") { Task { await appDelegate.model.synthesize() } }
+                    .keyboardShortcut("g", modifiers: .command)
+                Button("Play or stop") { appDelegate.model.toggleOutputPlayback() }
+                    .keyboardShortcut("p", modifiers: .command)
+            }
         }
 
         Settings {
@@ -37,6 +50,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
         NSApp.activate()
+        NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            let handled = MainActor.assumeIsolated { self?.handleSpace(event) ?? false }
+            return handled ? nil : event
+        }
+    }
+
+    /// Space does the primary action in the main window, unless a text field has focus.
+    private func handleSpace(_ event: NSEvent) -> Bool {
+        guard event.keyCode == 49, !event.isARepeat,
+              event.modifierFlags.intersection(.deviceIndependentFlagsMask).subtracting(.capsLock).isEmpty,
+              let window = NSApp.keyWindow, window.title == "DELTA-TTS", window.attachedSheet == nil,
+              !(window.firstResponder is NSText) else { return false }
+        model.performPrimaryAction()
+        return true
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }

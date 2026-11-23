@@ -81,11 +81,14 @@ final class AppModel {
     let audioDevices = AudioDevices()
     private(set) var missingMicrophone: String?  // the chosen microphone was not connected at the last recording
     private(set) var noMicrophone = false
+    private(set) var missingOutput: String?  // the chosen output device is not connected
+    private(set) var outputNotice: Notice?  // shown for a few seconds after the output changed by itself
 
     // Generation
     private(set) var isSynthesizing = false
     private(set) var output: SynthesisOutput?
     private(set) var generationError: String?
+    private(set) var lastTiming: String?  // for staff, in Settings; never on the main screen
     private(set) var serverNotices: [Notice] = []
     private(set) var isResetting = false
     private(set) var readyForNextVisitor = false  // shown briefly after Next visitor
@@ -127,10 +130,9 @@ final class AppModel {
         self.config = config
         consentAcknowledged = UserDefaults.standard.bool(forKey: Self.consentKey)
         text = config.demo.defaultText
-        audioDevices.onDefaultOutputChange = { [weak self] in
-            self?.player.outputDeviceChanged()
-            self?.promptPlayer.outputDeviceChanged()
-        }
+        audioDevices.onDefaultOutputChange = { [weak self] in self?.defaultOutputChanged() }
+        audioDevices.onChange = { [weak self] in self?.applyOutputRoute() }
+        applyOutputRoute()
         if let loadError {
             alert = AlertItem(title: "Cannot read your settings", message: loadError)
         }
@@ -268,9 +270,62 @@ final class AppModel {
         return "\(name) (not connected)"
     }
 
-    /// "Output: MacBook Pro Speakers (system default)".
+    /// "Output: MacBook Pro Speakers (system default)", or the chosen device.
     var outputLabel: String {
-        "Output: \(audioDevices.defaultOutputName ?? "unknown device") (system default)"
+        "Output: \(outputName)"
+    }
+
+    /// The output device in use: the chosen one, or the system default.
+    var outputName: String {
+        let chosen = config.app.outputDeviceUid
+        if !chosen.isEmpty, let device = audioDevices.outputs.first(where: { $0.id == chosen }) { return device.name }
+        return "\(audioDevices.defaultOutputName ?? "unknown device") (system default)"
+    }
+
+    /// Play on `device`, or on the system default output when nil.
+    func chooseOutput(_ device: OutputDevice?) {
+        config.app.outputDeviceUid = device?.id ?? ""
+        config.app.outputDeviceName = device?.name ?? ""
+        outputNotice = nil
+        applyOutputRoute()
+    }
+
+    /// The system default output changed (e.g. headphones plugged in): a chosen device gives way
+    /// to it, so that the sound follows what was just connected.
+    private func defaultOutputChanged() {
+        if !config.app.outputDeviceUid.isEmpty {
+            config.app.outputDeviceUid = ""
+            config.app.outputDeviceName = ""
+            let notice = Notice(level: .info, code: "output_switched", message:
+                "Output switched to \(audioDevices.defaultOutputName ?? "the new default") (system default).")
+            outputNotice = notice
+            Task {
+                try? await Task.sleep(for: .seconds(6))
+                if outputNotice == notice { outputNotice = nil }
+            }
+        }
+        applyOutputRoute()
+        player.outputDeviceChanged()
+        promptPlayer.outputDeviceChanged()
+    }
+
+    /// Route both players to the chosen output when it is connected, else to the system default.
+    private func applyOutputRoute() {
+        let chosen = config.app.outputDeviceUid
+        let connected = !chosen.isEmpty && audioDevices.outputs.contains { $0.id == chosen }
+        missingOutput = !chosen.isEmpty && !connected
+            ? (config.app.outputDeviceName.isEmpty ? "The chosen output" : config.app.outputDeviceName) : nil
+        player.route(to: connected ? chosen : nil)
+        promptPlayer.route(to: connected ? chosen : nil)
+    }
+
+    /// The compute mode of both the requests and the server's startup (one setting).
+    var computeMode: ComputeMode {
+        get { config.synthesis.compute }
+        set {
+            config.synthesis.compute = newValue
+            config.server.compute = newValue
+        }
     }
 
     func stopRecording() {
@@ -392,6 +447,8 @@ final class AppModel {
             }
             try player.load(data: wav)
             output = SynthesisOutput(wav: wav, response: response, inputKey: key)
+            lastTiming = Self.timingSummary(response)
+            print("[synthesis] \(lastTiming ?? "")")
             serverNotices = response.warnings
             attemptedWithoutInput = false
             player.play()
@@ -406,16 +463,113 @@ final class AppModel {
         }
     }
 
-    /// "4.1 s of speech, made in 1.3 s (3.2x faster than real time)".
-    func speedSummary(_ response: SynthesisResponse) -> String {
-        var summary = "\(formatSeconds(response.durationSeconds)) of speech, made in \(formatSeconds(response.elapsedSeconds))"
-        if let rtf = response.rtf, rtf > 0 {
-            summary += rtf < 1
-                ? String(format: " (%.1fx faster than real time)", 1 / rtf)
-                : String(format: " (real-time factor %.2f)", rtf)
-        }
-        if response.dryRun == true { summary += " · test tone" }
+    /// Timing of a generation, for staff only (Settings > General and the app's standard output):
+    /// "1.8 s of speech in 0.52 s, RTF 0.29, exact".
+    static func timingSummary(_ response: SynthesisResponse) -> String {
+        var summary = String(format: "%.2f s of speech in %.2f s", response.durationSeconds, response.elapsedSeconds)
+        if let rtf = response.rtf { summary += String(format: ", RTF %.3f", rtf) }
+        if let compute = response.compute { summary += ", \(compute)" }
+        if response.fellBack == true { summary += " (fell back to float32)" }
+        if response.dryRun == true { summary += ", dry run" }
         return summary
+    }
+
+    // -----------------------------
+    // The primary action: one button in a fixed place, changing with the state
+    // -----------------------------
+    enum PrimaryAction: Equatable {
+        case record, stopRecording, generate, generating, play, stopPlayback, nextVisitor, resetting
+
+        var title: String {
+            switch self {
+            case .record: "Record your voice"
+            case .stopRecording: "Stop"
+            case .generate: "Generate my voice"
+            case .generating: "Generating..."
+            case .play: "Play"
+            case .stopPlayback: "Stop"
+            case .nextVisitor: "Next visitor"
+            case .resetting: "Clearing..."
+            }
+        }
+
+        var systemImage: String? {
+            switch self {
+            case .record: "mic.fill"
+            case .stopRecording, .stopPlayback: "stop.fill"
+            case .generate: "waveform"
+            case .play: "play.fill"
+            case .nextVisitor: "arrow.counterclockwise"
+            case .generating, .resetting: nil  // a progress indicator instead
+            }
+        }
+
+        var shortcutHint: String {
+            switch self {
+            case .record, .stopRecording: "Space or \u{2318}R"
+            case .generate: "Space, Return in the text or \u{2318}G"
+            case .play, .stopPlayback: "Space or \u{2318}P"
+            case .nextVisitor: "Space or \u{2318}N"
+            case .generating, .resetting: ""
+            }
+        }
+    }
+
+    /// Record, then stop, generate, play, and start over for the next visitor.
+    var primaryAction: PrimaryAction {
+        if isResetting { return .resetting }
+        if recorder.isCapturing { return .stopRecording }
+        if isSynthesizing { return .generating }
+        if promptURL == nil { return .record }
+        if outputIsCurrent {
+            if player.isPlaying { return .stopPlayback }
+            return player.timesFinished > 0 ? .nextVisitor : .play
+        }
+        return .generate
+    }
+
+    var primaryActionEnabled: Bool {
+        switch primaryAction {
+        case .record: canRecord
+        case .generate: blockingReason == nil
+        case .generating, .resetting: false
+        case .stopRecording, .play, .stopPlayback, .nextVisitor: true
+        }
+    }
+
+    func performPrimaryAction() {
+        guard primaryActionEnabled else { return }
+        switch primaryAction {
+        case .record: startRecording()
+        case .stopRecording: stopRecording()
+        case .generate: Task { await synthesize() }
+        case .play, .stopPlayback: toggleOutputPlayback()
+        case .nextVisitor: Task { await nextVisitor() }
+        case .generating, .resetting: break
+        }
+    }
+
+    /// Return (or Command-Return) in the text field: generate, when that is the next step.
+    func performPrimaryActionFromText() {
+        if primaryAction == .generate, primaryActionEnabled {
+            Task { await synthesize() }
+        }
+    }
+
+    /// Command-R: record, or stop the countdown or recording.
+    func toggleRecording() {
+        if recorder.isCapturing {
+            stopRecording()
+        } else if canRecord {
+            startRecording()
+        }
+    }
+
+    /// Command-P: play or stop the generated voice.
+    func toggleOutputPlayback() {
+        guard output != nil else { return }
+        promptPlayer.stop()
+        player.toggle()
     }
 
     // -----------------------------
@@ -463,13 +617,13 @@ final class AppModel {
                 return Instruction(text: "The microphone is not available. Use a sample voice in step 1.",
                                    level: .warning, systemImage: "mic.slash")
             }
-            return Instruction(text: "Press \"Record your voice\", then read the sentence aloud.", level: .info, systemImage: "mic")
+            return Instruction(text: "Press \"Record your voice\" below, then read the sentence aloud.", level: .info, systemImage: "mic")
         case 2:
             return Instruction(text: "Type what you want your voice to say.", level: .info, systemImage: "keyboard")
         case 3:
             switch serverState {
             case .ready:
-                return Instruction(text: "Press \"Generate my voice\".", level: .info, systemImage: "sparkles")
+                return Instruction(text: "Press \"Generate my voice\" below. You can change the text first.", level: .info, systemImage: "sparkles")
             case .unknown, .loading:
                 return Instruction(text: "The voice engine is starting. Please wait a moment.", level: .warning, systemImage: "hourglass")
             case .unreachable, .failed:
@@ -477,7 +631,10 @@ final class AppModel {
                                    level: .warning, systemImage: "exclamationmark.triangle.fill")
             }
         default:
-            return Instruction(text: "Done! Listen to your voice. Press \"Next visitor\" when you are finished.",
+            if player.isPlaying {
+                return Instruction(text: "This is your voice.", level: .info, systemImage: "speaker.wave.2")
+            }
+            return Instruction(text: "Done! Play it again, or press \"Next visitor\" when you are finished.",
                                level: .info, systemImage: "checkmark.circle")
         }
     }
@@ -615,6 +772,11 @@ final class AppModel {
             notices.append(Notice(level: .warning, code: "mic_missing", message:
                 "\(missingMicrophone) is not connected; using the system default microphone."))
         }
+        if let missingOutput {
+            notices.append(Notice(level: .warning, code: "output_missing", message:
+                "\(missingOutput) is not connected; using the system default output."))
+        }
+        if let outputNotice { notices.append(outputNotice) }
         if noMicrophone {
             notices.append(Notice(level: .error, code: "mic_none", message:
                 "No microphone found. Connect one, or use a sample voice."))

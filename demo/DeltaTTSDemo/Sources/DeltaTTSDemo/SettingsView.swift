@@ -34,6 +34,7 @@ struct GeneralSettings: View {
         Form {
             Section {
                 LabeledContent("Status", value: engineStatus)
+                LabeledContent("Last generation", value: model.lastTiming ?? "None yet")
                 HStack {
                     if model.serverProcess.isRunning {
                         Button("Stop Server", systemImage: "stop.circle") { model.serverProcess.stop() }
@@ -212,7 +213,16 @@ struct DemoSettings: View {
                         Text(model.microphoneLabel).tag(model.config.recording.inputDeviceUid)
                     }
                 }
-                LabeledContent("Output", value: (model.audioDevices.defaultOutputName ?? "unknown") + " (system default)")
+                Picker("Output", selection: output) {
+                    Text("System default" + (model.audioDevices.defaultOutputName.map { " (\($0))" } ?? "")).tag("")
+                    ForEach(model.audioDevices.outputs) { device in
+                        Text(device.name).tag(device.id)
+                    }
+                    if !model.config.app.outputDeviceUid.isEmpty,
+                       !model.audioDevices.outputs.contains(where: { $0.id == model.config.app.outputDeviceUid }) {
+                        Text("\(model.config.app.outputDeviceName) (not connected)").tag(model.config.app.outputDeviceUid)
+                    }
+                }
                 LabeledContent("Microphone access", value: microphoneStatus)
                 if model.recorder.access == .denied {
                     Button("Open Privacy & Security Settings") {
@@ -224,11 +234,16 @@ struct DemoSettings: View {
             } header: {
                 Text("Recording")
             } footer: {
-                Text("Mono 16-bit WAV. A chosen microphone is remembered; when it is not connected, the system default is used. Playback always follows the system default output (choose headphones in System Settings > Sound). Recordings stay in a private temporary folder and are deleted on Next visitor and when the app quits. The minimum length warning is in the Warnings tab.")
+                Text("Mono 16-bit WAV. A chosen microphone is remembered; when it is not connected, the system default is used. A chosen output gives way to the system default when the default changes (e.g. headphones plugged in). Both are also on the main screen. Recordings stay in a private temporary folder and are deleted on Next visitor and when the app quits.")
             }
         }
         .formStyle(.grouped)
         .onAppear { model.recorder.refreshAccess() }
+    }
+
+    private var output: Binding<String> {
+        Binding(get: { model.config.app.outputDeviceUid },
+                set: { uid in model.chooseOutput(model.audioDevices.outputs.first { $0.id == uid }) })
     }
 
     private var microphone: Binding<String> {
@@ -264,13 +279,10 @@ struct ServerSettings: View {
                     Text("CUDA").tag("cuda")
                     Text("CPU").tag("cpu")
                 }
-                Picker("Compute at startup", selection: $model.config.server.compute) {
-                    ForEach(ComputeMode.allCases) { Text($0.title).tag($0) }
-                }
             } header: {
                 Text("Server")
             } footer: {
-                Text("Read by the server when the app starts it; restart the server to apply. Keep the host at 127.0.0.1: the server is for local use only.")
+                Text("Read by the server when the app starts it; restart the server to apply. Keep the host at 127.0.0.1: the server is for local use only. The compute mode is in the Synthesis tab.")
             }
 
             Section("Models") {
@@ -402,14 +414,14 @@ struct SynthesisSettings: View {
             }
 
             Section {
-                Picker("Compute", selection: $model.config.synthesis.compute) {
+                Picker("Mode", selection: $model.computeMode) {
                     ForEach(ComputeMode.allCases) { Text($0.title).tag($0) }
                 }
                 .pickerStyle(.segmented)
             } header: {
                 Text("Compute mode")
             } footer: {
-                Text("Exact runs DELTA-TTS in float32. Fast runs it in float16: its outputs differ numerically from exact ones, and a step that overflows float16 is recomputed in float32, after which the rest of that utterance stays in float32. The first fast request creates a float16 copy of the model (about 1 GB).")
+                Text("Exact runs DELTA-TTS in float32 and reproduces the paper. Fast runs it in float16: faster, with numerically different outputs (a step that overflows is redone in float32). Also on the main screen as Mode.")
             }
         }
         .formStyle(.grouped)

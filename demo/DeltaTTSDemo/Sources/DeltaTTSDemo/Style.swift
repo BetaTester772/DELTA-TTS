@@ -208,6 +208,52 @@ struct LevelMeter: View {
     }
 }
 
+/// Playback position: a thin rounded track with a blue fill and elapsed / total time. It is
+/// redrawn every display frame from the player's own position, without implicit animation, so
+/// it moves exactly with the audio: from 0 when playback starts to the end when it ends, where it
+/// stays until the next playback. Clicking it plays from that point.
+struct PlaybackBar: View {
+    @Environment(\.uiScale) private var scale
+    var player: AudioPlayer
+
+    var body: some View {
+        TimelineView(.animation(paused: !player.isPlaying)) { _ in
+            let progress = player.progress
+            let total = player.duration.rounded()
+            let elapsed = player.atEnd ? total : min(player.currentTime.rounded(.down), total)
+            HStack(spacing: 10 * scale) {
+                GeometryReader { geometry in
+                    ZStack(alignment: .leading) {
+                        Capsule().fill(Theme.hairline)
+                        Capsule().fill(Theme.accent)
+                            .frame(width: geometry.size.width * progress)
+                    }
+                    .frame(height: 6 * scale)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .contentShape(.rect)
+                    .onTapGesture { location in
+                        guard geometry.size.width > 0 else { return }
+                        player.play(from: location.x / geometry.size.width * player.duration)
+                    }
+                }
+                .frame(height: 22 * scale)
+                .help("Click to play from there")
+                Text("\(Self.clock(elapsed)) / \(Self.clock(total))")
+                    .monospacedDigit()
+                    .foregroundStyle(Theme.tertiaryText)
+                    .fixedSize()
+            }
+            .transaction { $0.animation = nil }
+        }
+    }
+
+    /// Seconds as "0:04".
+    static func clock(_ seconds: Double) -> String {
+        let whole = max(0, Int(seconds))
+        return String(format: "%d:%02d", whole / 60, whole % 60)
+    }
+}
+
 extension Notice.Level {
     var color: Color {
         switch self {
